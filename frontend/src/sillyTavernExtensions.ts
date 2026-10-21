@@ -917,7 +917,14 @@ export function updateSillyTavernRuntime(patch: Omit<RuntimeState, 'chat'>) {
 }
 
 async function loadJson<T>(url: string): Promise<T | null> {
-  const response = await fetch(url);
+  const token = window.localStorage.getItem('doubletrouble.authToken') || '';
+  const accessToken = window.localStorage.getItem('doubletrouble.accessToken') || '';
+  const response = await fetch(url, {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
+    },
+  });
   if (!response.ok) {
     return null;
   }

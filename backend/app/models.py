@@ -50,7 +50,8 @@ class Session(BaseModel):
     participants: dict[str, Participant] = Field(default_factory=dict)
     messages: list[Message] = Field(default_factory=list)
     turn: TurnState = Field(default_factory=TurnState)
-
+    active_card_id: str = ""
+    active_chat_id: str = ""
 
 class JoinSessionRequest(BaseModel):
     participant_id: str | None = None

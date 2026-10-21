@@ -4,19 +4,20 @@ import base64
 import json
 import asyncio
 import logging
+import os
 import re
 import time
 
 import httpx
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from backend.app.config import PROJECT_ROOT, ensure_admin_code, load_config
+from backend.app.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, ensure_admin_code, load_config
 from backend.app.models import ClientEvent, JoinSessionRequest, SendMessageRequest
 from pydantic import BaseModel, Field
 
@@ -39,10 +40,11 @@ from backend.app.storage.file_storage import FileStorage
 
 
 config = load_config()
-generated_admin_code = ensure_admin_code(config, PROJECT_ROOT / "config" / "config.yaml")
+generated_admin_code = ensure_admin_code(config, DEFAULT_CONFIG_PATH)
 if generated_admin_code:
     logging.getLogger(__name__).warning("Generated new admin code: %s", generated_admin_code)
-    admin_code_file = PROJECT_ROOT / "config" / ".admin_code.txt"
+    admin_code_file = DEFAULT_CONFIG_PATH.parent / ".admin_code.txt"
+    admin_code_file.parent.mkdir(parents=True, exist_ok=True)
     admin_code_file.write_text(f"Admin code: {generated_admin_code}\n", encoding="utf-8")
     logging.getLogger(__name__).warning("Admin code written to: %s", admin_code_file)
 storage = FileStorage(config.storage.data_root, config.storage.default_user)
@@ -148,12 +150,12 @@ class MagicTranslationRequest(BaseModel):
 
 
 async def _broadcast_chat(card_id: str, chat_id: str) -> None:
+    session_service.set_active_chat(DEFAULT_SESSION_ID, card_id, chat_id)
     chat = bot_chats_service.get_chat(card_id, chat_id)
     await connection_manager.broadcast(
         DEFAULT_SESSION_ID,
         {"type": "chat.updated", "card_id": card_id, "chat": chat.model_dump(mode="json")},
     )
-
 
 def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     chat = bot_chats_service.get_chat(card_id, chat_id)
@@ -211,12 +213,26 @@ def _auth_user_from_request(request: Request) -> AuthUser | None:
 
 
 def _access_token_from_request(request: Request) -> str:
-    return request.headers.get("x-doubletrouble-access", "").strip() or str(request.cookies.get("doubletrouble_access") or "").strip()
+    return (
+        request.headers.get("x-doubletrouble-access", "").strip()
+        or str(request.cookies.get("doubletrouble_access") or "").strip()
+        or str(request.query_params.get("access_token") or "").strip()
+    )
 
 
-AUTH_RATE_LIMIT_MAX = 5
+AUTH_RATE_LIMIT_MAX = 15
 AUTH_RATE_LIMIT_WINDOW = 60.0
 _auth_rate_limit_store: dict[str, list[float]] = {}
+
+
+def _request_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+    return request.client.host if request.client else "unknown"
 
 
 def _check_auth_rate_limit(client_ip: str) -> None:
@@ -230,13 +246,21 @@ def _check_auth_rate_limit(client_ip: str) -> None:
 def _check_csrf(request: Request) -> None:
     if not config.security.cookie_auth or request.method in ("GET", "HEAD", "OPTIONS"):
         return
-    origin = request.headers.get("origin", "")
+    if (
+        request.headers.get("authorization")
+        or request.headers.get("x-doubletrouble-access")
+        or request.headers.get("x-doubletrouble-actor")
+    ):
+        return
+    origin = request.headers.get("origin", "").strip()
     if not origin:
         return
+    origin_host = urlparse(origin).netloc.lower()
+    forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip().lower()
+    request_host = (forwarded_host or request.headers.get("host", "")).strip().lower()
     expected = str(request.base_url).rstrip("/")
-    if origin != expected:
+    if origin != expected and (not origin_host or origin_host != request_host):
         raise HTTPException(status_code=403, detail="Invalid origin")
-
 
 def _require_access_password(request: Request) -> None:
     _check_csrf(request)
@@ -442,7 +466,7 @@ def _provider_key_payloads() -> list[dict[str, object]]:
     ]
 
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024
-RATE_LIMIT_MAX = 30
+RATE_LIMIT_MAX = 240
 RATE_LIMIT_WINDOW = 60.0
 _rate_limit_store: dict[str, list[float]] = {}
 
@@ -483,8 +507,10 @@ class RateLimitMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["method"] in ("POST", "PUT", "DELETE", "PATCH"):
+            headers = {k.lower(): v.decode("latin1", errors="ignore") for k, v in scope.get("headers", [])}
+            forwarded = headers.get(b"x-forwarded-for", "").split(",")[0].strip()
             client = scope.get("client")
-            client_ip = client[0] if client else "unknown"
+            client_ip = forwarded or headers.get(b"x-real-ip", "").strip() or (client[0] if client else "unknown")
             now = time.time()
             _rate_limit_store.setdefault(client_ip, [t for t in _rate_limit_store.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW])
             if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_MAX:
@@ -523,6 +549,20 @@ def _decode_base64_payload(value: str) -> bytes:
 async def on_startup() -> None:
     storage.ensure_layout()
     session_service.get_or_create_session(DEFAULT_SESSION_ID)
+    logging.getLogger("uvicorn.error").info("DoubleTrouble admin code: %s", config.auth.admin_code)
+
+    env_access_pw = (os.environ.get("DOUBLE_TROUBLE_ACCESS_PASSWORD") or os.environ.get("ACCESS_PASSWORD") or "").strip()
+    env_auth_req = (os.environ.get("DOUBLE_TROUBLE_AUTH_REQUIRED") or os.environ.get("AUTH_REQUIRED") or "").strip().lower()
+    if env_access_pw or env_auth_req in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        sec_payload = settings_service.security_settings_payload()
+        if env_access_pw and len(env_access_pw) >= 4:
+            sec_payload.access_password = env_access_pw
+            sec_payload.access_password_required = True
+        if env_auth_req in {"1", "true", "yes", "on"}:
+            sec_payload.auth_required = True
+        elif env_auth_req in {"0", "false", "no", "off"}:
+            sec_payload.auth_required = False
+        settings_service.update_security_settings(sec_payload)
 
     # Bootstrap built-in default presets on first run (only if user has none yet)
     if not any(presets_service.list_presets("openai")):
@@ -531,8 +571,6 @@ async def on_startup() -> None:
     # Activate the built-in Default OpenAI preset if no active preset is set
     if not settings_service.active_preset_settings().get("openai"):
         settings_service.set_active_preset("openai", "Default")
-
-
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -1009,7 +1047,7 @@ async def public_config() -> dict[str, object]:
 
 @app.post("/api/auth/register")
 async def auth_register(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
-    _check_auth_rate_limit(request.client.host if request.client else "unknown")
+    _check_auth_rate_limit(_request_client_ip(request))
     _require_access_password(request)
     if not settings_service.registration_allowed():
         raise HTTPException(status_code=403, detail="Registration is disabled")
@@ -1017,35 +1055,33 @@ async def auth_register(payload: AuthRequest, request: Request, response: Respon
         user, token = auth_service.register(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    if config.security.cookie_auth:
-        response.set_cookie(
-            "doubletrouble_auth_token",
-            token,
-            httponly=True,
-            secure=config.security.cookie_secure,
-            samesite=config.security.cookie_samesite,
-            path="/",
-        )
+    response.set_cookie(
+        "doubletrouble_auth_token",
+        token,
+        httponly=True,
+        secure=config.security.cookie_secure,
+        samesite=config.security.cookie_samesite,
+        path="/",
+    )
     return {"token": token, "user": auth_service.public_user(user)}
 
 
 @app.post("/api/auth/login")
 async def auth_login(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
-    _check_auth_rate_limit(request.client.host if request.client else "unknown")
+    _check_auth_rate_limit(_request_client_ip(request))
     _require_access_password(request)
     try:
         user, token = auth_service.login(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
-    if config.security.cookie_auth:
-        response.set_cookie(
-            "doubletrouble_auth_token",
-            token,
-            httponly=True,
-            secure=config.security.cookie_secure,
-            samesite=config.security.cookie_samesite,
-            path="/",
-        )
+    response.set_cookie(
+        "doubletrouble_auth_token",
+        token,
+        httponly=True,
+        secure=config.security.cookie_secure,
+        samesite=config.security.cookie_samesite,
+        path="/",
+    )
     return {"token": token, "user": auth_service.public_user(user)}
 
 
@@ -1106,20 +1142,19 @@ async def get_access_password_status(request: Request) -> dict[str, object]:
 
 @app.post("/api/security/access")
 async def unlock_access_password(payload: AccessPasswordRequest, request: Request, response: Response) -> dict[str, object]:
-    _check_auth_rate_limit(request.client.host if request.client else "unknown")
+    _check_auth_rate_limit(_request_client_ip(request))
     try:
         token = settings_service.verify_access_password(payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
-    if config.security.cookie_auth:
-        response.set_cookie(
-            "doubletrouble_access",
-            token,
-            httponly=True,
-            secure=config.security.cookie_secure,
-            samesite=config.security.cookie_samesite,
-            path="/",
-        )
+    response.set_cookie(
+        "doubletrouble_access",
+        token,
+        httponly=True,
+        secure=config.security.cookie_secure,
+        samesite=config.security.cookie_samesite,
+        path="/",
+    )
     return {"ok": True, "required": settings_service.access_password_required(), "token": token}
 
 
@@ -1746,6 +1781,7 @@ async def import_character_card(request: Request, file: UploadFile = File(...)) 
         card = character_cards_service.import_card(file.filename, await file.read())
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"импортировал карточку: {card.name}", actor=_actor_from_request(request))
     return {"card": card.model_dump(mode="json")}
 
@@ -1781,6 +1817,7 @@ async def create_character_card(
         card = character_cards_service.create_card(payload, avatar_content)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"создал карточку: {card.name}", actor=_actor_from_request(http_request))
     return {"card": card.model_dump(mode="json")}
 
@@ -1799,6 +1836,7 @@ async def update_character_card(card_id: str, payload: CharacterCardUpdate, requ
         if not any(message.role == "user" for message in chat.messages):
             updated_chat = _ensure_card_first_message(card_id, chat.id)
             await _broadcast_chat(card_id, updated_chat.id)
+    await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"обновил карточку: {card.name}", actor=_actor_from_request(request))
     return {"card": card.model_dump(mode="json")}
 
@@ -1814,6 +1852,7 @@ async def update_character_card_avatar(card_id: str, request: Request, file: Upl
         raise HTTPException(status_code=404, detail="Card not found") from error
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"обновил аватар карточки: {card.name}", actor=_actor_from_request(request))
     return {"card": card.model_dump(mode="json")}
 
@@ -1847,6 +1886,7 @@ async def current_bot_chat(card_id: str, request: ChatCreate, http_request: Requ
     _require_permission(http_request, "view_chats")
     chat = bot_chats_service.current_or_create(card_id, request.character_name)
     chat = _ensure_card_first_message(card_id, chat.id)
+    session_service.set_active_chat(DEFAULT_SESSION_ID, card_id, chat.id)
     return {"chat": chat.model_dump(mode="json")}
 
 
@@ -2107,6 +2147,7 @@ async def list_personas(request: Request) -> dict[str, object]:
 async def create_persona(payload: PersonaCreate, request: Request) -> dict[str, object]:
     _require_permission(request, "edit_personas")
     persona = personas_service.create_persona(payload)
+    await _broadcast_shared_settings("personas")
     await _broadcast_notification(f"создал персону: {persona.name}", actor=_actor_from_request(request))
     return {"persona": persona.model_dump(mode="json")}
 
@@ -2118,6 +2159,7 @@ async def update_persona(persona_id: str, payload: PersonaUpdate, request: Reque
         persona = personas_service.update_persona(persona_id, payload)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
+    await _broadcast_shared_settings("personas")
     await _broadcast_notification(f"обновил персону: {persona.name}", actor=_actor_from_request(request))
     return {"persona": persona.model_dump(mode="json")}
 
@@ -2132,6 +2174,7 @@ async def delete_persona(persona_id: str, request: Request) -> dict[str, object]
         raise HTTPException(status_code=404, detail="Persona not found") from error
     settings_service.clear_delete_lock("personas", persona_id)
     await _broadcast_delete_locks()
+    await _broadcast_shared_settings("personas")
     await _broadcast_notification(f"удалил персону: {persona.name}", actor=_actor_from_request(request))
     return {"ok": True, "persona": persona.model_dump(mode="json")}
 
@@ -2143,6 +2186,7 @@ async def activate_persona(persona_id: str, request: Request) -> dict[str, objec
         persona = personas_service.activate_persona(persona_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
+    await _broadcast_shared_settings("personas")
     await _broadcast_notification(f"изменил активную персону: {persona.name}", actor=_actor_from_request(request))
     return {"persona": persona.model_dump(mode="json")}
 
@@ -2158,6 +2202,7 @@ async def upload_persona_avatar(persona_id: str, request: Request, file: UploadF
         raise HTTPException(status_code=400, detail=str(error)) from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
+    await _broadcast_shared_settings("personas")
     await _broadcast_notification(f"обновил аватар персоны: {persona.name}", actor=_actor_from_request(request))
     return {"persona": persona.model_dump(mode="json")}
 
@@ -2229,6 +2274,10 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
             raw_event = await websocket.receive_json()
             event = ClientEvent.model_validate(raw_event)
 
+            if event.type == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
             if event.type == "participant.join":
                 participant = session_service.join_session(
                     session_id,
@@ -2258,9 +2307,20 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                 await _broadcast_presence(session_id)
 
             if event.type == "card.select" and event.name:
+                if event.card_id:
+                    session_service.set_active_chat(session_id, event.card_id, event.chat_id or "")
+                    await connection_manager.broadcast(
+                        session_id,
+                        {
+                            "type": "card.select",
+                            "card_id": event.card_id,
+                            "chat_id": event.chat_id or "",
+                            "name": event.name,
+                            "source_participant_id": event.participant_id or participant_id or "",
+                        },
+                    )
                 actor = event.username or event.persona_name or event.name or ""
                 await _broadcast_notification(f"выбрал карточку: {event.name}", session_id, actor)
-
             if event.type == "notification" and event.content:
                 await _broadcast_notification(event.content, session_id, event.username or event.persona_name or event.name or "")
 

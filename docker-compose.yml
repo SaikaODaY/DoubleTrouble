@@ -1,0 +1,25 @@
+services:
+  doubletrouble:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: doubletrouble
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8017}:8017"
+    environment:
+      - DOUBLE_TROUBLE_HOST=0.0.0.0
+      - DOUBLE_TROUBLE_PORT=8017
+      - DOUBLE_TROUBLE_ALLOW_EXTERNAL=true
+      - DOUBLE_TROUBLE_OPEN_BROWSER=false
+      - DOUBLE_TROUBLE_DATA_ROOT=/data
+      - DOUBLE_TROUBLE_CONFIG_PATH=/data/config.yaml
+      - ADMIN_CODE=${ADMIN_CODE:-}
+      - ACCESS_PASSWORD=${ACCESS_PASSWORD:-}
+      - AUTH_REQUIRED=${AUTH_REQUIRED:-false}
+      - DOUBLE_TROUBLE_API_KEY=${DOUBLE_TROUBLE_API_KEY:-}
+    volumes:
+      - doubletrouble-data:/data
+
+volumes:
+  doubletrouble-data:

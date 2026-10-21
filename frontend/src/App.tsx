@@ -227,7 +227,7 @@ type RealtimePayload = {
   card_id?: string;
   chat_id?: string;
   chat?: BotChat;
-  session?: { participants?: Record<string, Participant> };
+  session?: { participants?: Record<string, Participant>; active_card_id?: string; active_chat_id?: string };
   message?: string;
   message_id?: string;
   replace_message_id?: string | null;
@@ -739,7 +739,7 @@ export default function App() {
   const [registrationAllowed, setRegistrationAllowed] = useState(true);
   const [botReplyAllowed, setBotReplyAllowed] = useState(true);
   const [authChecked, setAuthChecked] = useState(false);
-  const [accessToken, setAccessToken] = useState('');
+  const [accessToken, setAccessToken] = useState(() => window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '');
   const [accessPasswordRequired, setAccessPasswordRequired] = useState(false);
   const [accessPasswordConfigured, setAccessPasswordConfigured] = useState(false);
   const [accessUnlocked, setAccessUnlocked] = useState(false);
@@ -795,6 +795,8 @@ export default function App() {
   const authUserRef = useRef<AuthUser | null>(null);
   const activeCardRef = useRef<CharacterCard | null>(null);
   const activeChatRef = useRef<BotChat | null>(null);
+  const cardsRef = useRef<CharacterCard[]>([]);
+  const sessionActiveTargetRef = useRef<{ cardId: string; chatId: string }>({ cardId: '', chatId: '' });
   const personasRef = useRef<Persona[]>([]);
   const personasLoadedRef = useRef(false);
   const selectedPersonaIdRef = useRef(selectedPersonaId);
@@ -825,6 +827,10 @@ export default function App() {
   }, [activeCard, activeChat]);
 
   useEffect(() => {
+    cardsRef.current = cards;
+  }, [cards]);
+
+  useEffect(() => {
     selectedPersonaIdRef.current = selectedPersonaId;
   }, [selectedPersonaId]);
 
@@ -849,15 +855,12 @@ export default function App() {
   }, [authToken]);
 
   useEffect(() => {
-    if (cookieAuth) {
-      return;
-    }
     if (authToken) {
       window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
     } else {
       window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
     }
-  }, [authToken, cookieAuth]);
+  }, [authToken]);
 
   useEffect(() => {
     window.localStorage.setItem(VISUAL_STORAGE_KEY, JSON.stringify(visualSettings));
@@ -919,8 +922,10 @@ export default function App() {
 
   useEffect(() => {
     if (accessToken) {
+      window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, accessToken);
       void verifyAccessPasswordToken(accessToken);
     } else {
+      window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
       setAccessUnlocked(!accessPasswordRequired);
     }
   }, [accessToken, accessPasswordRequired]);
@@ -1023,10 +1028,10 @@ export default function App() {
   }, [activeMessages, activeCard?.id, activeCard?.name, activeCard?.image_url, personas, activeReferencePersonas, selectedPersonaId, selectedPersona?.name, authUser?.username, generationSettings.bot_name, authToken, accessToken, extensionLeader, presetJsonDraft, activeConnectionPresetName, generationSettings.chat_completion_source, generationSettings.provider]);
 
   useEffect(() => {
-    if (authChecked && (!authRequired || authUser)) {
+    if (authChecked && (!accessPasswordRequired || accessUnlocked) && (!authRequired || authUser)) {
       void initSillyTavernExtensions();
     }
-  }, [authChecked, authRequired, authUser]);
+  }, [authChecked, accessPasswordRequired, accessUnlocked, authRequired, authUser]);
 
   useEffect(() => {
     renderedExtensionMessageSignaturesRef.current = new Map(activeMessages.map((message) => [message.id, extensionMessageSignature(message)]));
@@ -1049,121 +1054,186 @@ export default function App() {
   }, [activeMessages]);
 
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${protocol}//${window.location.host}/ws/sessions/default`);
-    websocketRef.current = socket;
-    socket.onopen = () => {
-      const currentPersona = personasRef.current.find((p) => p.id === selectedPersonaIdRef.current) || personasRef.current[0] || null;
-      sendPresence(currentPersona);
-      while (pendingRealtimeEventsRef.current.length) {
-        const ev = pendingRealtimeEventsRef.current.shift();
-        if (ev) {
-          sendRealtimeEvent(ev);
-        }
+    let disposed = false;
+    let reconnectTimer: number | undefined;
+    let pingInterval: number | undefined;
+
+    const connect = () => {
+      if (disposed) {
+        return;
       }
-    };
-    socket.onmessage = (event) => {
-      const payload = JSON.parse(event.data) as RealtimePayload;
-      if (payload.type === 'chat.updated' && payload.chat) {
-        if (activeChatRef.current?.id === payload.chat.id) {
-          setActiveChat(payload.chat);
-          setImagePendingMessages((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${payload.card_id || payload.chat?.card_id || ''}:${payload.chat?.id || ''}:`))));
-          document.querySelectorAll('#chat .iig-local-pending').forEach((element) => element.classList.remove('iig-local-pending'));
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const params = new URLSearchParams();
+      if (authToken) params.set('auth', authToken);
+      if (accessToken) params.set('access_token', accessToken);
+      const qs = params.toString();
+      const socket = new WebSocket(`${protocol}//${window.location.host}/ws/sessions/default${qs ? `?${qs}` : ''}`);
+      websocketRef.current = socket;
+      socket.onopen = () => {
+        const currentPersona = personasRef.current.find((p) => p.id === selectedPersonaIdRef.current) || personasRef.current[0] || null;
+        sendPresence(currentPersona);
+        while (pendingRealtimeEventsRef.current.length) {
+          const ev = pendingRealtimeEventsRef.current.shift();
+          if (ev) {
+            sendRealtimeEvent(ev);
+          }
         }
-        if (payload.card_id && activeCardRef.current?.id === payload.card_id) {
-          void refreshCardChats(payload.card_id);
+        window.clearInterval(pingInterval);
+        pingInterval = window.setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 25000);
+      };
+      socket.onmessage = (event) => {
+        const payload = JSON.parse(event.data) as RealtimePayload;
+        if (payload.type === 'pong') {
+          return;
         }
-      }
-      if ((payload.type === 'image_generation.pending' || payload.type === 'image_generation.finished') && payload.card_id && payload.chat_id && payload.message_id && payload.source_participant_id !== imageEventSourceIdRef.current) {
-        if (payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
-          const key = imagePendingKey(payload.card_id, payload.chat_id, payload.message_id);
-          setImagePendingMessages((current) => {
-            if (payload.type === 'image_generation.pending') {
-              return { ...current, [key]: true };
+        if (payload.type === 'chat.updated' && payload.chat) {
+          if (activeChatRef.current?.id === payload.chat.id || (!activeChatRef.current && payload.card_id && activeCardRef.current?.id === payload.card_id)) {
+            setActiveChat(payload.chat);
+            setImagePendingMessages((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${payload.card_id || payload.chat?.card_id || ''}:${payload.chat?.id || ''}:`))));
+            document.querySelectorAll('#chat .iig-local-pending').forEach((element) => element.classList.remove('iig-local-pending'));
+          } else if (!activeCardRef.current && payload.card_id) {
+            const targetCard = cardsRef.current.find((c) => c.id === payload.card_id);
+            if (targetCard) {
+              setActiveCard(targetCard);
+              setActiveChat(payload.chat);
+              rememberChatSelection(targetCard.id, payload.chat.id);
             }
-            const next = { ...current };
-            delete next[key];
-            return next;
-          });
+          }
+          if (payload.card_id && activeCardRef.current?.id === payload.card_id) {
+            void refreshCardChats(payload.card_id);
+          }
         }
-      }
-      if (payload.type === 'chat.deleted' && payload.chat_id === activeChatRef.current?.id) {
-        setActiveChat(null);
-      }
-      if (payload.type === 'card.deleted' && payload.card_id) {
-        setCards((current) => current.filter((card) => card.id !== payload.card_id));
-        if (activeCardRef.current?.id === payload.card_id) {
-          setActiveCard(null);
+        if (payload.type === 'card.select' && payload.card_id && payload.source_participant_id !== participantIdRef.current) {
+          const targetCard = cardsRef.current.find((c) => c.id === payload.card_id);
+          if (targetCard && (!activeCardRef.current || activeCardRef.current.id !== targetCard.id || (payload.chat_id && activeChatRef.current?.id !== payload.chat_id))) {
+            if (payload.chat_id) {
+              void openChatForCard(targetCard, payload.chat_id);
+            } else {
+              void selectBotCard(targetCard, false);
+            }
+          }
+        }
+        if ((payload.type === 'image_generation.pending' || payload.type === 'image_generation.finished') && payload.card_id && payload.chat_id && payload.message_id && payload.source_participant_id !== imageEventSourceIdRef.current) {
+          if (payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+            const key = imagePendingKey(payload.card_id, payload.chat_id, payload.message_id);
+            setImagePendingMessages((current) => {
+              if (payload.type === 'image_generation.pending') {
+                return { ...current, [key]: true };
+              }
+              const next = { ...current };
+              delete next[key];
+              return next;
+            });
+          }
+        }
+        if (payload.type === 'chat.deleted' && payload.chat_id === activeChatRef.current?.id) {
           setActiveChat(null);
-          setBotChats([]);
         }
-      }
-      if ((payload.type === 'presence.updated' || payload.type === 'session.snapshot' || payload.type === 'session.updated') && payload.session?.participants) {
-        sessionSnapshotReceivedRef.current = true;
-        const nextParticipants = Object.values(payload.session.participants);
-        const ownParticipant = nextParticipants.find((participant) => participant.id === participantIdRef.current);
-        if (ownParticipant?.persona_id) {
-          lastKnownParticipantPersonaIdRef.current = ownParticipant.persona_id;
-          restoreSelectedPersonaFromParticipant(ownParticipant.persona_id);
-        } else {
-          selectDefaultPersonaIfNeeded();
+        if (payload.type === 'card.deleted' && payload.card_id) {
+          setCards((current) => current.filter((card) => card.id !== payload.card_id));
+          if (activeCardRef.current?.id === payload.card_id) {
+            setActiveCard(null);
+            setActiveChat(null);
+            setBotChats([]);
+          }
         }
-        setParticipants(nextParticipants);
-      }
-      if (payload.type === 'notification' && payload.message) {
-        addToast(payload.message);
-      }
-      if (payload.type === 'generation.started' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
-        activeGenerationRef.current = true;
-        setIsGenerating(true);
-        setGenerationStreamText('');
-        setGenerationReplaceMessageId(payload.replace_message_id || null);
-        setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
-      }
-      if (payload.type === 'generation.stream' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
-        activeGenerationRef.current = true;
-        setIsGenerating(true);
-        setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
-        setGenerationReplaceMessageId(payload.replace_message_id || null);
-        setGenerationStreamText(payload.message || '');
-      }
-      if ((payload.type === 'generation.finished' || payload.type === 'generation.cancelled' || payload.type === 'generation.failed') && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
-        activeGenerationRef.current = false;
-        setIsGenerating(false);
-        setGenerationStatus('');
-        setGenerationStreamText('');
-        setGenerationReplaceMessageId(null);
-        if (payload.type === 'generation.failed' && payload.message) {
+        if ((payload.type === 'presence.updated' || payload.type === 'session.snapshot' || payload.type === 'session.updated') && payload.session?.participants) {
+          sessionSnapshotReceivedRef.current = true;
+          if (payload.session.active_card_id) {
+            sessionActiveTargetRef.current = { cardId: payload.session.active_card_id, chatId: payload.session.active_chat_id || '' };
+            if (!activeCardRef.current && cardsRef.current.length) {
+              const targetCard = cardsRef.current.find((c) => c.id === payload.session?.active_card_id);
+              if (targetCard) {
+                if (payload.session.active_chat_id) {
+                  void openChatForCard(targetCard, payload.session.active_chat_id);
+                } else {
+                  void selectBotCard(targetCard, false);
+                }
+              }
+            }
+          }
+          const nextParticipants = Object.values(payload.session.participants);
+          const ownParticipant = nextParticipants.find((participant) => participant.id === participantIdRef.current);
+          if (ownParticipant?.persona_id) {
+            lastKnownParticipantPersonaIdRef.current = ownParticipant.persona_id;
+            restoreSelectedPersonaFromParticipant(ownParticipant.persona_id);
+          } else {
+            selectDefaultPersonaIfNeeded();
+          }
+          setParticipants(nextParticipants);
+        }
+        if (payload.type === 'notification' && payload.message) {
           addToast(payload.message);
         }
-      }
-      if (payload.type === 'security.updated') {
-        setAuthRequired(Boolean(payload.auth_required));
-        setRegistrationAllowed(payload.registration_allowed !== false);
-        setBotReplyAllowed(payload.bot_reply_allowed !== false);
-        setAccessPasswordRequired(Boolean(payload.access_password_required));
-        setSecurityAccessPasswordRequiredDraft(Boolean(payload.access_password_required));
-        setAccessPasswordConfigured(Boolean(payload.access_password_configured));
-        if (!payload.access_password_required) {
-          setAccessUnlocked(true);
+        if (payload.type === 'generation.started' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+          activeGenerationRef.current = true;
+          setIsGenerating(true);
+          setGenerationStreamText('');
+          setGenerationReplaceMessageId(payload.replace_message_id || null);
+          setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
         }
-        if (payload.permissions) {
-          setSecurityPermissions({ ...defaultSecurityPermissions, ...payload.permissions });
+        if (payload.type === 'generation.stream' && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+          activeGenerationRef.current = true;
+          setIsGenerating(true);
+          setGenerationStatus(`${activeCardRef.current?.name || t('composer.bot')} ${t('composer.typing')}`);
+          setGenerationReplaceMessageId(payload.replace_message_id || null);
+          setGenerationStreamText(payload.message || '');
         }
-        void refreshAccessControlledData();
-      }
-      if (payload.type === 'settings.updated') {
-        const section = payload.section || '';
-        void refreshSharedSettings(section);
-        window.dispatchEvent(new CustomEvent('doubletrouble:shared-settings-updated', { detail: { section } }));
-      }
-      if (payload.type === 'delete_locks.updated' && payload.delete_locks) {
-        setDeletionLocks({ ...defaultDeletionLocks, ...payload.delete_locks });
-        setPendingDeleteKey('');
-      }
+        if ((payload.type === 'generation.finished' || payload.type === 'generation.cancelled' || payload.type === 'generation.failed') && payload.card_id === activeCardRef.current?.id && payload.chat_id === activeChatRef.current?.id) {
+          activeGenerationRef.current = false;
+          setIsGenerating(false);
+          setGenerationStatus('');
+          setGenerationStreamText('');
+          setGenerationReplaceMessageId(null);
+          if (payload.type === 'generation.failed' && payload.message) {
+            addToast(payload.message);
+          }
+        }
+        if (payload.type === 'security.updated') {
+          setAuthRequired(Boolean(payload.auth_required));
+          setRegistrationAllowed(payload.registration_allowed !== false);
+          setBotReplyAllowed(payload.bot_reply_allowed !== false);
+          setAccessPasswordRequired(Boolean(payload.access_password_required));
+          setSecurityAccessPasswordRequiredDraft(Boolean(payload.access_password_required));
+          setAccessPasswordConfigured(Boolean(payload.access_password_configured));
+          if (!payload.access_password_required) {
+            setAccessUnlocked(true);
+          }
+          if (payload.permissions) {
+            setSecurityPermissions({ ...defaultSecurityPermissions, ...payload.permissions });
+          }
+          void refreshAccessControlledData();
+        }
+        if (payload.type === 'settings.updated') {
+          const section = payload.section || '';
+          void refreshSharedSettings(section);
+          window.dispatchEvent(new CustomEvent('doubletrouble:shared-settings-updated', { detail: { section } }));
+        }
+        if (payload.type === 'delete_locks.updated' && payload.delete_locks) {
+          setDeletionLocks({ ...defaultDeletionLocks, ...payload.delete_locks });
+          setPendingDeleteKey('');
+        }
+      };
+      socket.onclose = () => {
+        window.clearInterval(pingInterval);
+        if (!disposed) {
+          reconnectTimer = window.setTimeout(connect, 2000);
+        }
+      };
     };
-    return () => socket.close();
-  }, []);
+
+    connect();
+    return () => {
+      disposed = true;
+      window.clearTimeout(reconnectTimer);
+      window.clearInterval(pingInterval);
+      websocketRef.current?.close();
+    };
+  }, [authToken, accessToken, accessUnlocked]);
 
   const addToast = (message: string) => {
     const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -1220,8 +1290,10 @@ export default function App() {
     }
   };
 
-  const actorHeaders = () => ({
+  const actorHeaders = (token = authTokenRef.current || authToken) => ({
     'X-DoubleTrouble-Actor': authUserRef.current?.username || selectedPersona?.name || 'Player',
+    ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   });
 
   const sendPresence = (persona: Persona | null) => {
@@ -1390,9 +1462,16 @@ export default function App() {
     return Array.from(byKey.values());
   };
 
-  const authJsonHeaders = () => ({ 'Content-Type': 'application/json', ...actorHeaders() });
-  const authedFetch = (url: string, init: RequestInit = {}) => fetch(url, { ...init, headers: { ...(init.headers || {}), ...actorHeaders() } });
-  const imageSrc = (url: string) => url;
+  const authJsonHeaders = (token = authTokenRef.current || authToken) => ({ 'Content-Type': 'application/json', ...actorHeaders(token) });
+  const authedFetch = (url: string, init: RequestInit = {}, token = authTokenRef.current || authToken) => fetch(url, { ...init, headers: { ...(init.headers || {}), ...actorHeaders(token) } });
+  const imageSrc = (url: string) => {
+    if (!url || (!url.startsWith('/api/') && !url.startsWith('/User Avatars/'))) return url;
+    const params = new URLSearchParams();
+    if (authToken) params.set('auth', authToken);
+    if (accessToken) params.set('access_token', accessToken);
+    const qs = params.toString();
+    return qs ? `${url}${url.includes('?') ? '&' : '?'}${qs}` : url;
+  };
   const deniedResponse = (response: Response) => response.status === 401 || response.status === 403;
   const markAccessDenied = (section: keyof AccessDeniedState, denied: boolean) => setAccessDenied((current) => ({ ...current, [section]: denied }));
 
@@ -1503,9 +1582,9 @@ export default function App() {
     setDeletionLocks({ ...defaultDeletionLocks, ...data.delete_locks });
   };
 
-  const loadCurrentUser = async () => {
+  const loadCurrentUser = async (token = authToken) => {
     const response = await fetch('/api/auth/me', {
-      headers: !cookieAuth && authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      headers: actorHeaders(token),
     });
     if (!response.ok) {
       if (!cookieAuth) {
@@ -1528,9 +1607,8 @@ export default function App() {
       setAuthMessage(data?.detail || t('auth.error.login'));
       return;
     }
-    if (!cookieAuth) {
-      setAuthToken(data.token);
-    }
+    authTokenRef.current = data.token;
+    setAuthToken(data.token);
     setAuthUser(data.user || null);
     setAuthDraft({ ...authDraft, password: '' });
     window.localStorage.setItem(AUTH_USERNAME_STORAGE_KEY, authDraft.username);
@@ -1541,9 +1619,8 @@ export default function App() {
 
   const logout = async () => {
     await fetch('/api/auth/logout', { method: 'POST', headers: actorHeaders() });
-    if (!cookieAuth) {
-      setAuthToken('');
-    }
+    authTokenRef.current = '';
+    setAuthToken('');
     setAuthUser(null);
     setAuthMessage(t('auth.loggedOut'));
     await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
@@ -2001,6 +2078,10 @@ export default function App() {
   };
 
   const refreshSharedSettings = async (section = '') => {
+    if (section === 'cards' || section === 'personas' || section === 'library') {
+      await refreshLibrary();
+      return;
+    }
     if (section === 'generation') {
       await Promise.all([loadGenerationSettings(), loadConnectionPresets()]);
       return;
@@ -2022,7 +2103,7 @@ export default function App() {
     if (section === 'extensions') {
       return;
     }
-    await Promise.all([loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
+    await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
     await reloadSelectedLorebook();
   };
 
@@ -2200,8 +2281,19 @@ export default function App() {
       return;
     }
     restoredSelectionRef.current = true;
+    const sessionTarget = sessionActiveTargetRef.current;
+    if (sessionTarget.cardId) {
+      const sessionCard = availableCards.find((item) => item.id === sessionTarget.cardId);
+      if (sessionCard) {
+        if (sessionTarget.chatId && await openChatForCard(sessionCard, sessionTarget.chatId)) {
+          return;
+        }
+        await selectBotCard(sessionCard, false);
+        return;
+      }
+    }
     const lastCardId = window.localStorage.getItem(LAST_CARD_STORAGE_KEY) || '';
-    const card = availableCards.find((item) => item.id === lastCardId);
+    const card = availableCards.find((item) => item.id === lastCardId) || availableCards[0];
     if (card) {
       await selectBotCard(card, false);
     }
@@ -2422,7 +2514,7 @@ export default function App() {
     if (rememberedChatId && await openChatForCard(card, rememberedChatId)) {
       setLibraryMessage(`${t('chat.openedLast')}: ${card.name}`);
       if (notify) {
-        sendRealtimeEvent({ type: 'card.select', name: card.name, persona_name: selectedPersona?.name || 'Player' });
+        sendRealtimeEvent({ type: 'card.select', card_id: card.id, chat_id: rememberedChatId, participant_id: participantIdRef.current, name: card.name, persona_name: selectedPersona?.name || 'Player' });
       }
       return;
     }
@@ -2443,7 +2535,7 @@ export default function App() {
     rememberChatSelection(card.id, chatData.chat.id);
     setLibraryMessage(`${t('chat.opened')}: ${chatData.chat.title}`);
     if (notify) {
-      sendRealtimeEvent({ type: 'card.select', name: card.name, persona_name: selectedPersona?.name || 'Player' });
+      sendRealtimeEvent({ type: 'card.select', card_id: card.id, chat_id: chatData.chat.id, participant_id: participantIdRef.current, name: card.name, persona_name: selectedPersona?.name || 'Player' });
     }
   };
 
@@ -2610,7 +2702,7 @@ export default function App() {
     setChatInput('');
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authJsonHeaders(),
       body: JSON.stringify({ author: selectedPersona?.name || 'Player', participant_id: participantIdRef.current, avatar_url: selectedPersona?.avatar_url || '', username: authUser?.username || '', is_admin: Boolean(authUser?.is_admin), role: 'user', content }),
     });
     if (!response.ok) {
@@ -2914,7 +3006,7 @@ export default function App() {
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages/${encodeURIComponent(message.id)}/swipe`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authJsonHeaders(),
       body: JSON.stringify({ direction }),
     });
     if (!response.ok) {
@@ -3184,7 +3276,7 @@ export default function App() {
         <div className="brand-block">
           <div>
             <strong>DoubleTrouble</strong>
-            <small>default session · 127.0.0.1:8017</small>
+            <small>default session · {window.location.host}</small>
           </div>
           <img className="brand-mark" src="/favicon.png" alt="DT" />
         </div>
@@ -4314,9 +4406,14 @@ function ImageExtensionSettingsPortal({ extension, imageSettings, setImageSettin
     try {
       const existingSettings = loadRawImageExtensionSettings();
       const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+      const accessToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
       const response = await fetch('/api/image-generation/models', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
+        },
         body: JSON.stringify({
           api_type: imageSettings.apiType,
           endpoint: imageSettings.endpoint,
@@ -4398,9 +4495,11 @@ function ExtensionsManager() {
 
   const headers = (json = false) => {
     const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+    const accessToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
     return {
       ...(json ? { 'Content-Type': 'application/json' } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
     };
   };
 

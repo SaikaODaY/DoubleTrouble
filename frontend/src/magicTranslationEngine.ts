@@ -216,13 +216,15 @@ export async function translateText(
   const preset = settings.promptPresets[settings.promptPreset];
   if (!preset) return null;
 
-  const token = window.localStorage.getItem('doubletrouble_auth_token') || '';
+  const token = window.localStorage.getItem('doubletrouble.authToken') || window.localStorage.getItem('doubletrouble_auth_token') || '';
+  const accessToken = window.localStorage.getItem('doubletrouble.accessToken') || '';
   const profile = settings.activeProfile ? settings.connectionProfiles[settings.activeProfile] : undefined;
   const response = await fetch('/api/magic-translation/translate', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
     },
     body: JSON.stringify({
       text,
