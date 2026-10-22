@@ -789,9 +789,14 @@ textarea {
 }
 .app-shell[data-show-avatars="false"] .message {
   grid-template-columns: minmax(0, 1fr);
+  column-gap: 0;
 }
 .app-shell[data-show-avatars="false"] .message-avatar-rail {
   display: none;
+}
+.app-shell[data-show-avatars="false"] .message-main,
+.app-shell[data-show-avatars="false"] .message-actions {
+  grid-column: 1;
 }
 
 .bot-rail,
