@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 import yaml
 
-from backend.app.config import GenerationConfig
+from backend.app.config import GenerationConfig, SummaryMemoryConfig
 from backend.app.llm.chat_completion_sources import resolve_source_id, get_source
 from backend.app.secrets import SecretStore
 
@@ -95,6 +95,26 @@ class DeleteLocks(BaseModel):
     chats: list[str] = Field(default_factory=list)
 
 
+
+class SummaryMemorySettingsUpdate(BaseModel):
+    enabled: bool = False
+    auto_summarize: bool = True
+    every_n_messages: int = Field(default=20, ge=2, le=500)
+    use_separate_api: bool = False
+    provider: str = "openai-compatible"
+    chat_completion_source: str = "custom"
+    base_url: str = ""
+    model: str = ""
+    api_key: str = ""
+    clear_api_key: bool = False
+    temperature: float = Field(default=0.3, ge=0, le=2)
+    max_tokens: int = Field(default=800, ge=100, le=8000)
+    prompt: str = (
+        "Summarize the key events, character relationships, important decisions, inventory/state changes, "
+        "and current situation from the roleplay conversation. Integrate with any existing chronicle seamlessly. "
+        "Write a concise, well-structured chronicle in the same language as the chat."
+    )
+
 class UserSettings(BaseModel):
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     generation_presets: list[GenerationConnectionPreset] = Field(default_factory=list)
@@ -109,7 +129,7 @@ class UserSettings(BaseModel):
     access_token: str = ""
     security_permissions: SecurityPermissions = Field(default_factory=SecurityPermissions)
     delete_locks: DeleteLocks = Field(default_factory=DeleteLocks)
-
+    summary_memory: SummaryMemoryConfig = Field(default_factory=SummaryMemoryConfig)
 
 class SettingsService:
     def __init__(self, settings_path: Path, secret_store: SecretStore) -> None:
@@ -144,6 +164,49 @@ class SettingsService:
             "parameters": dict(generation.parameters),
         }
 
+
+    def summary_memory_config(self) -> SummaryMemoryConfig:
+        return self.settings.summary_memory
+
+    def summary_memory_settings(self) -> dict[str, object]:
+        cfg = self.settings.summary_memory
+        return {
+            "enabled": cfg.enabled,
+            "auto_summarize": cfg.auto_summarize,
+            "every_n_messages": cfg.every_n_messages,
+            "use_separate_api": cfg.use_separate_api,
+            "provider": cfg.provider,
+            "chat_completion_source": cfg.chat_completion_source,
+            "base_url": cfg.base_url,
+            "model": cfg.model,
+            "api_key_configured": self.secret_store.exists(cfg.api_key_secret, ""),
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+            "prompt": cfg.prompt,
+        }
+
+    def update_summary_memory_settings(self, request: SummaryMemorySettingsUpdate) -> SummaryMemoryConfig:
+        current = self.settings.summary_memory
+        if request.clear_api_key:
+            self.secret_store.clear(current.api_key_secret)
+        elif request.api_key.strip():
+            self.secret_store.write(current.api_key_secret, request.api_key.strip())
+        self.settings.summary_memory = SummaryMemoryConfig(
+            enabled=request.enabled,
+            auto_summarize=request.auto_summarize,
+            every_n_messages=max(2, min(500, int(request.every_n_messages))),
+            use_separate_api=request.use_separate_api,
+            provider=request.provider.strip() or "openai-compatible",
+            chat_completion_source=request.chat_completion_source.strip() or "custom",
+            base_url=request.base_url.strip().rstrip("/"),
+            model=request.model.strip(),
+            api_key_secret=current.api_key_secret,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            prompt=request.prompt.strip() or current.prompt,
+        )
+        self._save_settings()
+        return self.settings.summary_memory
     @staticmethod
     def _effective_source_id(generation: GenerationConfig) -> str:
         if generation.chat_completion_source:

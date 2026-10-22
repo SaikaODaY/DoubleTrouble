@@ -21,7 +21,19 @@ from backend.app.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, ensure_admin_c
 from backend.app.models import ClientEvent, JoinSessionRequest, SendMessageRequest
 from pydantic import BaseModel, Field
 
-from backend.app.services.bot_chats_service import BotChatsService, ChatCreate, ChatMessageCreate, ChatMessageUpdate, ChatSwipeRequest, ChatUpdate
+from backend.app.services.bot_chats_service import (
+    BotChatsService,
+    ChatBranchRequest,
+    ChatCreate,
+    ChatDiceRollRequest,
+    ChatMemoryUpdate,
+    ChatMessageCreate,
+    ChatMessageUpdate,
+    ChatSwipeRequest,
+    ChatSwipeVoteRequest,
+    ChatUpdate,
+    PartyHudState,
+)
 from backend.app.services.character_cards_service import CharacterCardCreate, CharacterCardsService, CharacterCardUpdate
 from backend.app.realtime.connection_manager import ConnectionManager
 from backend.app.secrets import SecretStore
@@ -34,7 +46,13 @@ from backend.app.llm.openai_compatible import OpenAICompatibleProvider
 from backend.app.services.personas_service import PersonaCreate, PersonasService, PersonaUpdate
 from backend.app.services.auth_service import AuthService, AuthUser
 from backend.app.services.presets_service import PresetPayload, PresetsService
-from backend.app.services.settings_service import GenerationPresetSave, GenerationSettingsUpdate, SecuritySettingsPayload, SettingsService
+from backend.app.services.settings_service import (
+    GenerationPresetSave,
+    GenerationSettingsUpdate,
+    SecuritySettingsPayload,
+    SettingsService,
+    SummaryMemorySettingsUpdate,
+)
 from backend.app.services.session_service import DEFAULT_SESSION_ID, SessionService
 from backend.app.storage.file_storage import FileStorage
 
@@ -149,13 +167,31 @@ class MagicTranslationRequest(BaseModel):
     source_settings: dict[str, Any] = Field(default_factory=dict)
 
 
-async def _broadcast_chat(card_id: str, chat_id: str, switch_active: bool = False) -> None:
-    session_service.set_active_chat(DEFAULT_SESSION_ID, card_id, chat_id)
+def _session_id_from_request(request: Request | None = None) -> str:
+    if request is None:
+        return DEFAULT_SESSION_ID
+    header_sid = request.headers.get("x-doubletrouble-session", "").strip()
+    if header_sid:
+        return header_sid
+    query_sid = str(request.query_params.get("session_id") or "").strip()
+    return query_sid or DEFAULT_SESSION_ID
+
+
+def _target_sessions_for_chat(card_id: str, chat_id: str, primary_session_id: str = DEFAULT_SESSION_ID, switch_active: bool = False) -> set[str]:
+    targets = {primary_session_id or DEFAULT_SESSION_ID}
+    if not switch_active:
+        for sid, sess in session_service.sessions.items():
+            if sess.active_card_id == card_id and (not sess.active_chat_id or sess.active_chat_id == chat_id):
+                targets.add(sid)
+    return targets
+
+
+async def _broadcast_chat(card_id: str, chat_id: str, switch_active: bool = False, session_id: str = DEFAULT_SESSION_ID) -> None:
+    session_service.set_active_chat(session_id, card_id, chat_id)
     chat = bot_chats_service.get_chat(card_id, chat_id)
-    await connection_manager.broadcast(
-        DEFAULT_SESSION_ID,
-        {"type": "chat.updated", "card_id": card_id, "chat": chat.model_dump(mode="json"), "switch_active": switch_active},
-    )
+    payload = {"type": "chat.updated", "card_id": card_id, "chat": chat.model_dump(mode="json"), "switch_active": switch_active}
+    for target_sid in _target_sessions_for_chat(card_id, chat_id, session_id, switch_active):
+        await connection_manager.broadcast(target_sid, payload)
 def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     chat = bot_chats_service.get_chat(card_id, chat_id)
     character_data = character_cards_service.card_data(card_id)
@@ -176,14 +212,14 @@ def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     return bot_chats_service.add_bot_message(card_id, chat_id, chat.character_name, first_message, avatar_url, greeting_swipes)
 
 
-async def _broadcast_generation_state(card_id: str, chat_id: str, event_type: str, message: str = "", replace_message_id: str | None = None, streaming: bool | None = None) -> None:
+async def _broadcast_generation_state(card_id: str, chat_id: str, event_type: str, message: str = "", replace_message_id: str | None = None, streaming: bool | None = None, session_id: str = DEFAULT_SESSION_ID) -> None:
     event: dict[str, object] = {"type": event_type, "card_id": card_id, "chat_id": chat_id, "replace_message_id": replace_message_id}
     if message:
         event["message"] = message
     if streaming is not None:
         event["streaming"] = streaming
-    await connection_manager.broadcast(DEFAULT_SESSION_ID, event)
-
+    for target_sid in _target_sessions_for_chat(card_id, chat_id, session_id, False):
+        await connection_manager.broadcast(target_sid, event)
 
 async def _broadcast_presence(session_id: str = DEFAULT_SESSION_ID) -> None:
     await connection_manager.broadcast(
@@ -1502,6 +1538,12 @@ async def get_session(session_id: str, request: Request) -> dict[str, object]:
     return session_service.snapshot(session_id)
 
 
+
+@app.get("/api/rooms")
+async def list_rooms(request: Request) -> dict[str, object]:
+    _require_permission(request, "view_chats")
+    return {"rooms": session_service.list_rooms()}
+
 @app.post("/api/sessions/{session_id}/join")
 async def join_session(session_id: str, request: JoinSessionRequest, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "edit_messages")
@@ -1539,6 +1581,42 @@ async def update_generation_settings(request: GenerationSettingsUpdate, http_req
     await _broadcast_shared_settings("generation")
     return settings_service.generation_settings()
 
+
+
+@app.get("/api/settings/memory")
+async def get_summary_memory_settings(request: Request) -> dict[str, object]:
+    _require_permission(request, "view_presets")
+    return settings_service.summary_memory_settings()
+
+
+@app.put("/api/settings/memory")
+async def update_summary_memory_settings(request: SummaryMemorySettingsUpdate, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "manage_presets")
+    settings_service.update_summary_memory_settings(request)
+    await _broadcast_shared_settings("memory")
+    return settings_service.summary_memory_settings()
+
+
+@app.post("/api/settings/memory/models")
+async def summary_memory_models(request: SummaryMemorySettingsUpdate, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "manage_presets")
+    base_url = request.base_url.strip()
+    if base_url and not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="base_url must be http or https")
+    source_id = request.chat_completion_source or resolve_source_id(request.provider or "openai-compatible")
+    current_mem = settings_service.summary_memory_config()
+    api_key = request.api_key.strip() or secret_store.read(current_mem.api_key_secret, "")
+    if not api_key:
+        source = get_source(source_id)
+        if source and source.secret_key_name:
+            api_key = secret_store.read(source.secret_key_name, source.api_key_env)
+    provider = build_provider(
+        source_id,
+        base_url=base_url,
+        api_key=api_key,
+        timeout_seconds=30.0,
+    )
+    return await provider.status()
 
 @app.get("/api/generation/presets")
 async def generation_presets(request: Request) -> dict[str, object]:
@@ -2112,20 +2190,21 @@ async def list_bot_chats(card_id: str, request: Request) -> dict[str, object]:
 @app.post("/api/cards/{card_id}/chats/current")
 async def current_bot_chat(card_id: str, request: ChatCreate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "view_chats")
+    sid = _session_id_from_request(http_request)
     chat = bot_chats_service.current_or_create(card_id, request.character_name)
     chat = _ensure_card_first_message(card_id, chat.id)
-    session_service.set_active_chat(DEFAULT_SESSION_ID, card_id, chat.id)
+    session_service.set_active_chat(sid, card_id, chat.id)
     return {"chat": chat.model_dump(mode="json")}
 
 
 @app.post("/api/cards/{card_id}/chats")
 async def create_bot_chat(card_id: str, request: ChatCreate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "manage_chats")
+    sid = _session_id_from_request(http_request)
     chat = bot_chats_service.create_chat(card_id, request)
     chat = _ensure_card_first_message(card_id, chat.id)
-    await _broadcast_chat(card_id, chat.id, switch_active=True)
+    await _broadcast_chat(card_id, chat.id, switch_active=True, session_id=sid)
     return {"chat": chat.model_dump(mode="json")}
-
 
 @app.get("/api/cards/{card_id}/chats/{chat_id}")
 async def get_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
@@ -2140,35 +2219,52 @@ async def get_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str
 @app.put("/api/cards/{card_id}/chats/{chat_id}")
 async def update_bot_chat(card_id: str, chat_id: str, request: ChatUpdate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "manage_chats")
+    sid = _session_id_from_request(http_request)
     try:
         chat = bot_chats_service.update_chat(card_id, chat_id, request)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
-    await _broadcast_chat(card_id, chat_id)
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
     return {"chat": chat.model_dump(mode="json")}
-
 
 @app.post("/api/cards/{card_id}/chats/{chat_id}/copy")
 async def copy_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_chats")
+    sid = _session_id_from_request(request)
     try:
         chat = bot_chats_service.copy_chat(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
-    await _broadcast_chat(card_id, chat.id, switch_active=True)
+    await _broadcast_chat(card_id, chat.id, switch_active=True, session_id=sid)
     return {"chat": chat.model_dump(mode="json")}
 
+
+@app.post("/api/cards/{card_id}/chats/{chat_id}/branch")
+async def branch_bot_chat(card_id: str, chat_id: str, payload: ChatBranchRequest, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_chats")
+    sid = _session_id_from_request(request)
+    try:
+        chat = bot_chats_service.branch_chat(card_id, chat_id, payload.up_to_message_id, payload.title)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Message not found") from error
+    await _broadcast_chat(card_id, chat.id, switch_active=True, session_id=sid)
+    await _broadcast_notification(f"создал ветку сюжета: {chat.title}", session_id=sid, actor=_actor_from_request(request))
+    return {"chat": chat.model_dump(mode="json")}
 
 @app.delete("/api/cards/{card_id}/chats/{chat_id}")
 async def delete_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_chats")
+    sid = _session_id_from_request(request)
     _require_delete_unlocked("chats", _chat_lock_key(card_id, chat_id))
     try:
         bot_chats_service.delete_chat(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
     settings_service.clear_delete_lock("chats", _chat_lock_key(card_id, chat_id))
-    await connection_manager.broadcast(DEFAULT_SESSION_ID, {"type": "chat.deleted", "card_id": card_id, "chat_id": chat_id})
+    for target_sid in _target_sessions_for_chat(card_id, chat_id, sid, False):
+        await connection_manager.broadcast(target_sid, {"type": "chat.deleted", "card_id": card_id, "chat_id": chat_id})
     await _broadcast_delete_locks()
     return {"ok": True}
 
@@ -2203,28 +2299,74 @@ async def import_bot_chat_sillytavern(card_id: str, request: Request, file: Uplo
         chat = bot_chats_service.import_sillytavern_chat(card_id, char_name, file.filename, raw_text)
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    await _broadcast_chat(card_id, chat.id, switch_active=True)
-    await _broadcast_notification(f"импортировал чат: {chat.title}", actor=_actor_from_request(request))
+    sid = _session_id_from_request(request)
+    await _broadcast_chat(card_id, chat.id, switch_active=True, session_id=sid)
+    await _broadcast_notification(f"импортировал чат: {chat.title}", session_id=sid, actor=_actor_from_request(request))
     return {"chat": chat.model_dump(mode="json")}
 @app.post("/api/cards/{card_id}/chats/{chat_id}/messages")
 async def add_bot_chat_message(card_id: str, chat_id: str, request: ChatMessageCreate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "edit_messages")
+    sid = _session_id_from_request(http_request)
+    raw_trimmed = request.content.strip()
     try:
-        chat = bot_chats_service.add_message(card_id, chat_id, request)
+        if re.match(r"^/(?:roll|r)\b", raw_trimmed, flags=re.IGNORECASE):
+            formula_part = re.sub(r"^/(?:roll|r)\s*", "", raw_trimmed, flags=re.IGNORECASE).strip() or "1d20"
+            chat = bot_chats_service.roll_dice_message(
+                card_id,
+                chat_id,
+                ChatDiceRollRequest(
+                    author=request.author,
+                    participant_id=request.participant_id,
+                    avatar_url=request.avatar_url,
+                    username=request.username,
+                    is_admin=request.is_admin,
+                    formula=formula_part,
+                ),
+            )
+        else:
+            chat = bot_chats_service.add_message(card_id, chat_id, request)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    last_msg = chat.messages[-1] if chat.messages else None
+    all_ready = False
     if request.participant_id:
-        session_service.advance_turn(DEFAULT_SESSION_ID, request.participant_id)
+        if not (last_msg and last_msg.is_ooc):
+            all_ready = session_service.advance_turn(sid, request.participant_id)
         await connection_manager.broadcast(
-            DEFAULT_SESSION_ID,
+            sid,
             {"type": "typing.updated", "participant_id": request.participant_id, "name": request.author, "is_typing": False},
         )
-        await _broadcast_presence(DEFAULT_SESSION_ID)
-    await _broadcast_chat(card_id, chat_id)
-    return {"chat": chat.model_dump(mode="json")}
+        await _broadcast_presence(sid)
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    if all_ready:
+        await connection_manager.broadcast(
+            sid,
+            {"type": "round.all_ready", "card_id": card_id, "chat_id": chat_id, "trigger_participant_id": request.participant_id},
+        )
+    return {"chat": chat.model_dump(mode="json"), "all_ready": all_ready}
 
+
+@app.post("/api/cards/{card_id}/chats/{chat_id}/roll")
+async def roll_bot_chat_dice(card_id: str, chat_id: str, request: ChatDiceRollRequest, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "edit_messages")
+    sid = _session_id_from_request(http_request)
+    try:
+        chat = bot_chats_service.roll_dice_message(card_id, chat_id, request)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    all_ready = False
+    if request.participant_id:
+        all_ready = session_service.advance_turn(sid, request.participant_id)
+        await _broadcast_presence(sid)
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    if all_ready:
+        await connection_manager.broadcast(
+            sid,
+            {"type": "round.all_ready", "card_id": card_id, "chat_id": chat_id, "trigger_participant_id": request.participant_id},
+        )
+    return {"chat": chat.model_dump(mode="json"), "all_ready": all_ready}
 
 @app.put("/api/cards/{card_id}/chats/{chat_id}/messages/{message_id}")
 async def update_bot_chat_message(card_id: str, chat_id: str, message_id: str, request: ChatMessageUpdate, http_request: Request) -> dict[str, object]:
@@ -2237,7 +2379,7 @@ async def update_bot_chat_message(card_id: str, chat_id: str, message_id: str, r
         raise HTTPException(status_code=404, detail="Message not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    await _broadcast_chat(card_id, chat_id)
+    await _broadcast_chat(card_id, chat_id, session_id=_session_id_from_request(http_request))
     return {"chat": chat.model_dump(mode="json")}
 
 
@@ -2250,7 +2392,7 @@ async def delete_bot_chat_message(card_id: str, chat_id: str, message_id: str, r
         raise HTTPException(status_code=404, detail="Chat not found") from error
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Message not found") from error
-    await _broadcast_chat(card_id, chat_id)
+    await _broadcast_chat(card_id, chat_id, session_id=_session_id_from_request(request))
     return {"chat": chat.model_dump(mode="json")}
 
 
@@ -2265,13 +2407,85 @@ async def swipe_bot_chat_message(card_id: str, chat_id: str, message_id: str, re
         raise HTTPException(status_code=404, detail="Message not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    await _broadcast_chat(card_id, chat_id)
+    await _broadcast_chat(card_id, chat_id, session_id=_session_id_from_request(http_request))
     return {"chat": chat.model_dump(mode="json")}
 
+
+
+@app.post("/api/cards/{card_id}/chats/{chat_id}/messages/{message_id}/vote")
+async def vote_bot_chat_swipe(card_id: str, chat_id: str, message_id: str, request: ChatSwipeVoteRequest, http_request: Request) -> dict[str, object]:
+    _require_permission(http_request, "view_chats")
+    sid = _session_id_from_request(http_request)
+    voter = request.voter.strip() or _actor_from_request(http_request) or "Player"
+    try:
+        chat = bot_chats_service.toggle_swipe_vote(card_id, chat_id, message_id, voter, request.swipe_index)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Message not found") from error
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    return {"chat": chat.model_dump(mode="json")}
+
+
+@app.put("/api/cards/{card_id}/chats/{chat_id}/hud")
+async def update_bot_chat_hud(card_id: str, chat_id: str, payload: PartyHudState, request: Request) -> dict[str, object]:
+    _require_permission(request, "edit_messages")
+    sid = _session_id_from_request(request)
+    try:
+        chat = bot_chats_service.update_party_hud(card_id, chat_id, payload)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    return {"chat": chat.model_dump(mode="json")}
+
+
+@app.put("/api/cards/{card_id}/chats/{chat_id}/memory")
+async def update_bot_chat_memory(card_id: str, chat_id: str, payload: ChatMemoryUpdate, request: Request) -> dict[str, object]:
+    _require_permission(request, "edit_messages")
+    sid = _session_id_from_request(request)
+    try:
+        chat = bot_chats_service.update_chat_memory(card_id, chat_id, payload.memory_summary, payload.memory_summarized_count)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    return {"chat": chat.model_dump(mode="json")}
+
+
+async def _summarize_chat_now(card_id: str, chat_id: str, session_id: str = DEFAULT_SESSION_ID, force_full: bool = False) -> object:
+    chat = bot_chats_service.get_chat(card_id, chat_id)
+    mem_cfg = settings_service.summary_memory_config()
+    visible_msgs = [m for m in chat.messages if not m.hidden and not getattr(m, "is_ooc", False)]
+    start_idx = 0 if force_full else min(chat.memory_summarized_count, len(visible_msgs))
+    slice_to_summarize = visible_msgs[start_idx:]
+    if not slice_to_summarize and not force_full:
+        slice_to_summarize = visible_msgs[-min(len(visible_msgs), max(4, mem_cfg.every_n_messages)):]
+        existing = ""
+    else:
+        existing = "" if force_full else chat.memory_summary
+    new_summary = await generation_service.generate_chat_summary(mem_cfg, existing, slice_to_summarize, chat.character_name)
+    if new_summary:
+        chat = bot_chats_service.update_chat_memory(card_id, chat_id, new_summary, len(visible_msgs))
+        await _broadcast_chat(card_id, chat_id, session_id=session_id)
+    return chat
+
+
+@app.post("/api/cards/{card_id}/chats/{chat_id}/memory/summarize")
+async def summarize_bot_chat_memory(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "generate")
+    sid = _session_id_from_request(request)
+    try:
+        chat = await _summarize_chat_now(card_id, chat_id, session_id=sid, force_full=False)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Chat not found") from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Summary generation failed: {error}") from error
+    await _broadcast_notification("обновил хронику памяти чата (саммари)", session_id=sid, actor=_actor_from_request(request))
+    return {"chat": chat.model_dump(mode="json")}
 
 @app.post("/api/cards/{card_id}/chats/{chat_id}/bot/reply")
 async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Request, request: BotReplyRequest | None = None) -> dict[str, object]:
     _require_permission(http_request, "generate")
+    sid = _session_id_from_request(http_request)
     if not settings_service.bot_reply_allowed() and not (request and request.replace_message_id):
         raise HTTPException(status_code=403, detail="Bot reply button is disabled")
     task_key = f"{card_id}:{chat_id}"
@@ -2295,11 +2509,18 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         char_name = chat.character_name or "Bot"
         if regex_scripts:
             history = [
-                message.model_copy(update={"content": RegexService.get_regexed_string(message.content, RegexService.PLACEMENT_AI_OUTPUT, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name)})
+                message.model_copy(update={"content": RegexService.get_regexed_string(
+                    message.content,
+                    RegexService.PLACEMENT_USER_INPUT if message.role == "user" else RegexService.PLACEMENT_AI_OUTPUT,
+                    regex_scripts,
+                    is_prompt=True,
+                    user_name=user_name,
+                    char_name=char_name,
+                )})
                 for message in history
             ]
         char_book = character_data.get("character_book") if isinstance(character_data.get("character_book"), dict) else None
-        lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden], card_id, chat_id, persona_ids, character_book=char_book)
+        lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden and not getattr(message, "is_ooc", False)], card_id, chat_id, persona_ids, character_book=char_book)
         if regex_scripts:
             lorebook_context = lorebook_context.model_copy(update={
                 "worldInfoBefore": RegexService.get_regexed_string(lorebook_context.worldInfoBefore, RegexService.PLACEMENT_WORLD_INFO, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name),
@@ -2313,11 +2534,39 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
                 ],
             })
         world_info_payload = lorebook_context.model_dump(mode="json")
+        extra_before: list[str] = []
+        mem_cfg = settings_service.summary_memory_config()
+        if mem_cfg.enabled and chat.memory_summary.strip():
+            extra_before.append(f"[Story Chronicle / Memory so far:\n{chat.memory_summary.strip()}]")
+        if chat.party_hud and chat.party_hud.enabled:
+            hud = chat.party_hud
+            hud_lines = ["[Current Party State (HUD):"]
+            if hud.location.strip():
+                hud_lines.append(f"- Location: {hud.location.strip()}")
+            if hud.time_of_day.strip():
+                hud_lines.append(f"- Time: {hud.time_of_day.strip()}")
+            if hud.quest.strip():
+                hud_lines.append(f"- Active Quest/Goal: {hud.quest.strip()}")
+            if hud.notes.strip():
+                hud_lines.append(f"- Notes: {hud.notes.strip()}")
+            for pl in hud.players:
+                if pl.name.strip():
+                    details = ", ".join(p for p in [f"HP: {pl.hp}" if pl.hp else "", f"Status: {pl.status}" if pl.status else "", f"Inventory: {pl.inventory}" if pl.inventory else ""] if p)
+                    hud_lines.append(f"- {pl.name.strip()}: {details or 'Active'}")
+            hud_lines.append("]")
+            if len(hud_lines) > 2:
+                extra_before.append("\n".join(hud_lines))
+        if extra_before:
+            existing_wb = str(world_info_payload.get("worldInfoBefore") or "").strip()
+            world_info_payload["worldInfoBefore"] = ("\n\n".join([*extra_before, existing_wb]) if existing_wb else "\n\n".join(extra_before))
         if request and request.extension_prompts:
             world_info_payload["extensionPrompts"] = request.extension_prompts
+        sid = _session_id_from_request(http_request)
+        session_service.reset_round_ready(sid)
+        await _broadcast_presence(sid)
 
         async def broadcast_stream(content: str) -> None:
-            await _broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id)
+            await _broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id, session_id=sid)
 
         streaming_enabled = generation_service.should_stream_chat_reply(openai_preset)
         if streaming_enabled:
@@ -2325,12 +2574,31 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         else:
             task = asyncio.create_task(generation_service.generate_chat_reply(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, world_info_payload, multi_user_mode))
         generation_tasks[task_key] = task
-        await _broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id, streaming=streaming_enabled)
+        await _broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id, streaming=streaming_enabled, session_id=sid)
         reply = await task
         if streaming_enabled:
-            await _broadcast_generation_state(card_id, chat_id, "generation.stream", reply, replace_message_id)
+            await _broadcast_generation_state(card_id, chat_id, "generation.stream", reply, replace_message_id, session_id=sid)
         if regex_scripts:
             reply = RegexService.get_regexed_string(reply, RegexService.PLACEMENT_AI_OUTPUT, regex_scripts, is_prompt=False, user_name=user_name, char_name=char_name)
+        if chat.party_hud and chat.party_hud.enabled:
+            hud_matches = list(re.finditer(r"\[HUD:\s*([^\]]+)\]", reply, flags=re.IGNORECASE))
+            if hud_matches:
+                hud_copy = chat.party_hud.model_copy(deep=True)
+                for hm in hud_matches:
+                    for kv in hm.group(1).split("|"):
+                        if "=" in kv:
+                            k, v = [s.strip() for s in kv.split("=", 1)]
+                            kl = k.lower()
+                            if kl in {"location", "локация"}:
+                                hud_copy.location = v
+                            elif kl in {"time", "time_of_day", "время"}:
+                                hud_copy.time_of_day = v
+                            elif kl in {"quest", "квест", "цель"}:
+                                hud_copy.quest = v
+                            elif kl in {"notes", "заметки"}:
+                                hud_copy.notes = v
+                bot_chats_service.update_party_hud(card_id, chat_id, hud_copy)
+                reply = re.sub(r"\[HUD:\s*[^\]]+\]\s*", "", reply, flags=re.IGNORECASE).strip() or reply
         avatar_url = next((card.image_url for card in character_cards_service.list_cards() if card.id == card_id), "")
         if replace_message_id:
             chat = bot_chats_service.replace_bot_message(card_id, chat_id, replace_message_id, chat.character_name, reply, avatar_url, reset_swipes)
@@ -2341,15 +2609,15 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Message not found") from error
     except asyncio.CancelledError as error:
-        await _broadcast_generation_state(card_id, chat_id, "generation.cancelled", "Генерация отменена", replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.cancelled", "Генерация отменена", replace_message_id, session_id=sid)
         raise HTTPException(status_code=499, detail="Generation cancelled") from error
     except httpx.ReadTimeout as error:
         message = "Provider did not finish the response in time. Increase timeout or reduce max tokens/context."
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=504, detail=message) from error
     except httpx.RemoteProtocolError as error:
         message = f"Provider closed the connection before sending a response: {error}"
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=502, detail=message) from error
     except httpx.HTTPStatusError as error:
         try:
@@ -2357,30 +2625,42 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         except httpx.ResponseNotRead:
             response_text = "<streaming response body was not read>"
         message = f"Provider returned {error.response.status_code}: {response_text}"
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=502, detail=message) from error
     except httpx.HTTPError as error:
         message = f"Provider request failed: {error}"
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=502, detail=message) from error
     except RuntimeError as error:
         message = str(error)
-        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id)
+        await _broadcast_generation_state(card_id, chat_id, "generation.failed", message, replace_message_id, session_id=sid)
         raise HTTPException(status_code=400, detail=message) from error
     finally:
         generation_tasks.pop(task_key, None)
-    await _broadcast_chat(card_id, chat_id)
-    await _broadcast_generation_state(card_id, chat_id, "generation.finished", replace_message_id=replace_message_id)
+    await _broadcast_chat(card_id, chat_id, session_id=sid)
+    await _broadcast_generation_state(card_id, chat_id, "generation.finished", replace_message_id=replace_message_id, session_id=sid)
+    mem_cfg = settings_service.summary_memory_config()
+    if mem_cfg.enabled and mem_cfg.auto_summarize:
+        visible_count = len([m for m in chat.messages if not m.hidden and not getattr(m, "is_ooc", False)])
+        if visible_count - chat.memory_summarized_count >= max(2, mem_cfg.every_n_messages):
+            async def _bg_summarize() -> None:
+                try:
+                    await _summarize_chat_now(card_id, chat_id, session_id=sid, force_full=False)
+                    await _broadcast_notification("📜 память чата автоматически обновлена (авто-саммари)", session_id=sid)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("Auto-summarize failed: %s", exc)
+            asyncio.create_task(_bg_summarize())
     return {"chat": chat.model_dump(mode="json")}
 
 
 @app.post("/api/cards/{card_id}/chats/{chat_id}/bot/cancel")
 async def cancel_card_bot_reply(card_id: str, chat_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "generate")
+    sid = _session_id_from_request(request)
     task = generation_tasks.get(f"{card_id}:{chat_id}")
     if task and not task.done():
         task.cancel()
-        await _broadcast_generation_state(card_id, chat_id, "generation.cancelled", "Генерация отменяется")
+        await _broadcast_generation_state(card_id, chat_id, "generation.cancelled", "Генерация отменяется", session_id=sid)
         return {"cancelled": True}
     return {"cancelled": False}
 
@@ -2602,9 +2882,33 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                     },
                 )
 
-            if event.type == "turn.pass" and (event.participant_id or participant_id):
-                session_service.advance_turn(session_id, event.participant_id or participant_id or "")
+            if event.type == "turn.mode" and event.turn_mode:
+                session_service.set_turn_mode(session_id, event.turn_mode)
                 await _broadcast_presence(session_id)
+
+            if event.type == "turn.ready" and (event.participant_id or participant_id):
+                pid = event.participant_id or participant_id or ""
+                all_ready = session_service.mark_participant_ready(session_id, pid, ready=True if event.ready is None else bool(event.ready))
+                await _broadcast_presence(session_id)
+                if all_ready:
+                    sess = session_service.get_or_create_session(session_id)
+                    await connection_manager.broadcast(
+                        session_id,
+                        {"type": "round.all_ready", "card_id": event.card_id or sess.active_card_id, "chat_id": event.chat_id or sess.active_chat_id, "trigger_participant_id": pid},
+                    )
+
+            if event.type == "turn.pass" and (event.participant_id or participant_id):
+                pid = event.participant_id or participant_id or ""
+                all_ready = session_service.advance_turn(session_id, pid)
+                await _broadcast_presence(session_id)
+                if all_ready:
+                    sess = session_service.get_or_create_session(session_id)
+                    await connection_manager.broadcast(
+                        session_id,
+                        {"type": "round.all_ready", "card_id": event.card_id or sess.active_card_id, "chat_id": event.chat_id or sess.active_chat_id, "trigger_participant_id": pid},
+                    )
+
+            if event.type in {"image.pending", "image.done"}:
                 await connection_manager.broadcast(
                     session_id,
                     {
@@ -2615,7 +2919,6 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                         "source_participant_id": event.source_participant_id or event.participant_id or "",
                     },
                 )
-
             if event.type == "message.send" and event.participant_id and event.content:
                 message = session_service.add_message(
                     session_id,

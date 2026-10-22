@@ -13,14 +13,34 @@ class SessionService:
         self.sessions: dict[str, Session] = {}
 
     def get_or_create_session(self, session_id: str = DEFAULT_SESSION_ID) -> Session:
-        if session_id not in self.sessions:
-            self.sessions[session_id] = Session(
-                id=session_id,
-                title="Default Session",
-                messages=self.storage.load_messages(session_id),
+        clean_id = (session_id or DEFAULT_SESSION_ID).strip() or DEFAULT_SESSION_ID
+        if clean_id not in self.sessions:
+            self.sessions[clean_id] = Session(
+                id=clean_id,
+                title="Default Room" if clean_id == DEFAULT_SESSION_ID else f"Room: {clean_id}",
+                messages=self.storage.load_messages(clean_id),
             )
-        return self.sessions[session_id]
+        return self.sessions[clean_id]
 
+    def list_rooms(self) -> list[dict[str, object]]:
+        self.get_or_create_session(DEFAULT_SESSION_ID)
+        rooms: list[dict[str, object]] = []
+        for sid, sess in self.sessions.items():
+            online_players = [
+                p.persona_name or p.name
+                for p in sess.participants.values()
+                if p.connected and p.role == ParticipantRole.PLAYER
+            ]
+            rooms.append({
+                "id": sid,
+                "title": sess.title,
+                "online_count": len(online_players),
+                "online_players": online_players,
+                "active_card_id": sess.active_card_id,
+                "active_chat_id": sess.active_chat_id,
+                "turn_mode": sess.turn.mode,
+            })
+        return rooms
     def join_session(
         self,
         session_id: str,
@@ -89,8 +109,11 @@ class SessionService:
         participant = session.participants.get(participant_id)
         if participant:
             participant.connected = False
+        if participant_id in session.turn.ready_participant_ids:
+            session.turn.ready_participant_ids.remove(participant_id)
         if session.turn.current_participant_id == participant_id:
             self._advance_turn(session, participant_id)
+
     def add_message(self, session_id: str, request: SendMessageRequest) -> Message:
         session = self.get_or_create_session(session_id)
         participant = session.participants.get(request.participant_id)
@@ -140,9 +163,39 @@ class SessionService:
         session = self.get_or_create_session(session_id)
         return session.model_dump(mode="json")
 
-    def advance_turn(self, session_id: str, participant_id: str) -> None:
+    def advance_turn(self, session_id: str, participant_id: str) -> bool:
         session = self.get_or_create_session(session_id)
         self._advance_turn(session, participant_id)
+        return self.mark_participant_ready(session_id, participant_id, ready=True)
+
+    def set_turn_mode(self, session_id: str, mode: str) -> None:
+        session = self.get_or_create_session(session_id)
+        session.turn.mode = "round_ready" if mode == "round_ready" else "free"
+        session.turn.ready_participant_ids = []
+
+    def reset_round_ready(self, session_id: str) -> None:
+        session = self.get_or_create_session(session_id)
+        session.turn.ready_participant_ids = []
+
+    def mark_participant_ready(self, session_id: str, participant_id: str, ready: bool = True) -> bool:
+        session = self.get_or_create_session(session_id)
+        if session.turn.mode != "round_ready" or not participant_id:
+            return False
+        if ready:
+            if participant_id not in session.turn.ready_participant_ids:
+                session.turn.ready_participant_ids.append(participant_id)
+        else:
+            if participant_id in session.turn.ready_participant_ids:
+                session.turn.ready_participant_ids.remove(participant_id)
+            return False
+        connected_players = [
+            pid for pid, p in session.participants.items()
+            if p.connected and p.role == ParticipantRole.PLAYER
+        ]
+        if connected_players and all(pid in session.turn.ready_participant_ids for pid in connected_players):
+            session.turn.ready_participant_ids = []
+            return True
+        return False
 
     def _advance_turn(self, session: Session, participant_id: str) -> None:
         if participant_id and participant_id not in session.turn.order:

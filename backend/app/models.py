@@ -42,7 +42,8 @@ class Message(BaseModel):
 class TurnState(BaseModel):
     current_participant_id: str | None = None
     order: list[str] = Field(default_factory=list)
-
+    mode: str = "free"
+    ready_participant_ids: list[str] = Field(default_factory=list)
 
 class Session(BaseModel):
     id: str
@@ -78,3 +79,5 @@ class ClientEvent(BaseModel):
     username: str | None = None
     is_admin: bool | None = None
     is_typing: bool | None = None
+    turn_mode: str | None = None
+    ready: bool | None = None

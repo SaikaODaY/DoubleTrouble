@@ -53,6 +53,25 @@ class GenerationConfig(BaseModel):
     source_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
+
+class SummaryMemoryConfig(BaseModel):
+    enabled: bool = False
+    auto_summarize: bool = True
+    every_n_messages: int = Field(default=20, ge=2, le=500)
+    use_separate_api: bool = False
+    provider: str = "openai-compatible"
+    chat_completion_source: str = "custom"
+    base_url: str = ""
+    model: str = ""
+    api_key_secret: str = "summary_api_key"
+    temperature: float = 0.3
+    max_tokens: int = 800
+    prompt: str = (
+        "Summarize the key events, character relationships, important decisions, inventory/state changes, "
+        "and current situation from the roleplay conversation. Integrate with any existing chronicle seamlessly. "
+        "Write a concise, well-structured chronicle in the same language as the chat."
+    )
+
 class SecurityConfig(BaseModel):
     allow_key_checking: bool = True
     allow_external_connections: bool = False

@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 import yaml
 
-from backend.app.config import GenerationConfig
+from backend.app.config import GenerationConfig, SummaryMemoryConfig
 from backend.app.llm.base import ChatMessage, GenerationRequest
 from backend.app.llm.chat_completion_sources import build_provider, get_source, resolve_source_id
 from backend.app.llm.openai_compatible import OpenAICompatibleProvider
@@ -65,7 +65,9 @@ class GenerationService:
         source_id = config.chat_completion_source or resolve_source_id(config.provider)
         source = get_source(source_id)
         api_key = ""
-        if source and source.secret_key_name:
+        if config.api_key_secret and config.api_key_secret != "provider_api_key":
+            api_key = self.secret_store.read(config.api_key_secret, config.api_key_env)
+        if not api_key and source and source.secret_key_name:
             api_key = self.secret_store.read(source.secret_key_name, source.api_key_env)
         if not api_key:
             api_key = self.secret_store.read(config.api_key_secret, config.api_key_env)
@@ -80,6 +82,61 @@ class GenerationService:
             proxy_password=proxy_password,
         )
 
+
+    async def generate_chat_summary(
+        self,
+        memory_config: SummaryMemoryConfig,
+        existing_summary: str,
+        messages_to_summarize: list[BotChatMessage],
+        character_name: str,
+    ) -> str:
+        lines: list[str] = []
+        for msg in messages_to_summarize:
+            if msg.hidden or getattr(msg, "is_ooc", False):
+                continue
+            speaker = character_name if msg.role == "assistant" else (msg.author or "Player")
+            prefix = f"[Secret] {speaker}" if getattr(msg, "is_secret", False) else speaker
+            lines.append(f"{prefix}: {msg.content.strip()}")
+        transcript = "\n\n".join(lines).strip()
+        if not transcript and not existing_summary.strip():
+            return ""
+        sys_prompt = (memory_config.prompt or "").strip() or (
+            "Summarize the key events, character relationships, important decisions, inventory/state changes, "
+            "and current situation from the roleplay conversation. Write in the same language as the chat."
+        )
+        user_parts: list[str] = []
+        if existing_summary.strip():
+            user_parts.append(f"Existing chronicle / memory so far:\n{existing_summary.strip()}")
+        if transcript:
+            user_parts.append(f"New roleplay messages to integrate into the chronicle:\n{transcript}")
+        user_parts.append("Provide only the updated, unified chronicle without meta-commentary.")
+        prompt_messages = [
+            ChatMessage(role="system", content=sys_prompt),
+            ChatMessage(role="user", content="\n\n---\n\n".join(user_parts)),
+        ]
+        if memory_config.use_separate_api:
+            sum_config = GenerationConfig(
+                provider=memory_config.provider or "openai-compatible",
+                chat_completion_source=memory_config.chat_completion_source or "custom",
+                base_url=memory_config.base_url,
+                model=memory_config.model or self.config.model,
+                api_key_secret=memory_config.api_key_secret or "summary_api_key",
+                api_key_env="",
+                temperature=memory_config.temperature,
+                max_tokens=memory_config.max_tokens,
+                timeout_seconds=self.config.timeout_seconds,
+            )
+            return (await self.raw_generate_with_config(prompt_messages, sum_config)).strip()
+        if not self.is_enabled():
+            raise RuntimeError("Generation provider is disabled.")
+        request = GenerationRequest(
+            model=memory_config.model.strip() or self.config.model,
+            messages=prompt_messages,
+            temperature=memory_config.temperature,
+            max_tokens=memory_config.max_tokens,
+            parameters={},
+        )
+        return (await self._provider().generate(request)).strip()
     async def generate_reply(self, session_id: str) -> Message:
         if not self.is_enabled():
             raise RuntimeError("Generation provider is disabled. Configure it in the frontend settings first.")
@@ -263,7 +320,7 @@ class GenerationService:
         return messages
 
     def _build_bot_chat_messages(self, character_name: str, history: list[BotChatMessage], openai_preset: dict[str, Any] | None = None, character_data: dict[str, Any] | None = None, persona_name: str | None = None, persona_description: str | None = None, world_info: dict[str, Any] | None = None, multi_user_mode: bool = False) -> list[ChatMessage]:
-        visible_history = [message for message in history if not message.hidden]
+        visible_history = [message for message in history if not message.hidden and not getattr(message, "is_ooc", False)]
         persona_name = persona_name or next((message.author for message in reversed(visible_history) if message.role == "user" and message.author), "User")
         history_messages = self._history_messages(visible_history, openai_preset, multi_user_mode, character_name, persona_name)
         messages = self._tavern_openai_messages(openai_preset, character_name, persona_name, persona_description or "", character_data or {}, history_messages, world_info or {})
@@ -331,7 +388,11 @@ class GenerationService:
             msg_user = (message.author or persona_name) if role == "user" else persona_name
             content = self._substitute_prompt(message.content, character_name, msg_user)
             name = None
-            if (force_user_names or names_behavior == 2) and role == "user" and message.author:
+            if getattr(message, "is_secret", False) and not getattr(message, "secret_revealed", False) and role == "user":
+                content = f"[Secret action by {message.author or 'Player'} (hidden from other players): {content}]"
+            elif getattr(message, "is_dice_roll", False) and role == "user":
+                content = f"[Dice Roll] {content}"
+            elif (force_user_names or names_behavior == 2) and role == "user" and message.author:
                 prefix = f"{message.author}:"
                 if not content.startswith(prefix):
                     content = f"{message.author}: {content}"

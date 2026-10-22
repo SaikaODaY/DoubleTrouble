@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
-
 from pydantic import BaseModel, Field
 
 
@@ -26,10 +27,33 @@ class BotChatMessage(BaseModel):
     display_text: str = ""
     swipe_display_texts: dict[str, str] = Field(default_factory=dict)
     hidden: bool = False
+    is_ooc: bool = False
+    is_secret: bool = False
+    secret_revealed: bool = False
+    is_dice_roll: bool = False
+    dice_data: dict[str, Any] = Field(default_factory=dict)
     swipes: list[str] = Field(default_factory=list)
     active_swipe_index: int = 0
+    swipe_votes: dict[str, list[str]] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
+
+
+class PartyHudPlayer(BaseModel):
+    name: str = ""
+    hp: str = ""
+    status: str = ""
+    inventory: str = ""
+
+
+class PartyHudState(BaseModel):
+    enabled: bool = False
+    location: str = ""
+    time_of_day: str = ""
+    quest: str = ""
+    notes: str = ""
+    players: list[PartyHudPlayer] = Field(default_factory=list)
+
 
 class BotChat(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
@@ -39,8 +63,12 @@ class BotChat(BaseModel):
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
     messages: list[BotChatMessage] = Field(default_factory=list)
-
-
+    party_hud: PartyHudState = Field(default_factory=PartyHudState)
+    memory_summary: str = ""
+    memory_summarized_count: int = 0
+    last_summarized_at: str = ""
+    parent_chat_id: str = ""
+    branched_from_message_id: str = ""
 class BotChatSummary(BaseModel):
     id: str
     title: str
@@ -67,17 +95,45 @@ class ChatMessageCreate(BaseModel):
     is_admin: bool = False
     role: str = "user"
     content: str
+    is_ooc: bool = False
+    is_secret: bool = False
 
 
 class ChatMessageUpdate(BaseModel):
     content: str | None = None
     display_text: str | None = None
     hidden: bool | None = None
+    secret_revealed: bool | None = None
 
 
 class ChatSwipeRequest(BaseModel):
     direction: int = 1
 
+
+class ChatSwipeVoteRequest(BaseModel):
+    voter: str = "Player"
+    swipe_index: int | None = None
+
+
+class ChatBranchRequest(BaseModel):
+    up_to_message_id: str | None = None
+    title: str = ""
+
+
+class ChatDiceRollRequest(BaseModel):
+    author: str = "Player"
+    participant_id: str = ""
+    avatar_url: str = ""
+    username: str = ""
+    is_admin: bool = False
+    formula: str = "1d20"
+    label: str = ""
+    dc: int | None = None
+
+
+class ChatMemoryUpdate(BaseModel):
+    memory_summary: str = ""
+    memory_summarized_count: int | None = None
 
 class BotChatsService:
     def __init__(self, chats_dir: Path) -> None:
@@ -250,8 +306,33 @@ class BotChatsService:
         if not content:
             raise ValueError("Message content is required")
         role = request.role if request.role in {"user", "assistant", "system"} else "user"
+        is_ooc = bool(request.is_ooc)
+        is_secret = bool(request.is_secret) and not is_ooc
+        if content.lower().startswith("/ooc "):
+            is_ooc = True
+            is_secret = False
+            content = content[5:].strip()
+        elif content.lower().startswith(("/secret ", "/whisper ")):
+            is_secret = True
+            is_ooc = False
+            content = content.split(" ", 1)[1].strip() if " " in content else ""
+        if not content:
+            raise ValueError("Message content is required")
         swipes = [content] if role == "assistant" else []
-        chat.messages.append(BotChatMessage(role=role, author=request.author.strip() or "Player", participant_id=request.participant_id.strip(), avatar_url=request.avatar_url.strip(), username=request.username.strip(), is_admin=request.is_admin, content=content, swipes=swipes))
+        chat.messages.append(
+            BotChatMessage(
+                role=role,
+                author=request.author.strip() or "Player",
+                participant_id=request.participant_id.strip(),
+                avatar_url=request.avatar_url.strip(),
+                username=request.username.strip(),
+                is_admin=request.is_admin,
+                content=content,
+                swipes=swipes,
+                is_ooc=is_ooc,
+                is_secret=is_secret,
+            )
+        )
         chat.updated_at = utc_now()
         self._save(chat)
         return chat
@@ -284,6 +365,8 @@ class BotChatsService:
                         message.swipe_display_texts.pop(swipe_key, None)
                 if request.hidden is not None:
                     message.hidden = request.hidden
+                if request.secret_revealed is not None:
+                    message.secret_revealed = request.secret_revealed
                 message.updated_at = utc_now()
                 chat.updated_at = utc_now()
                 self._save(chat)
@@ -368,6 +451,129 @@ class BotChatsService:
                 self._save(chat)
                 return chat
         raise KeyError(message_id)
+
+    def toggle_swipe_vote(self, card_id: str, chat_id: str, message_id: str, voter: str, swipe_index: int | None = None) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        voter_clean = voter.strip() or "Player"
+        for message in chat.messages:
+            if message.id == message_id:
+                idx = str(swipe_index if swipe_index is not None else max(0, message.active_swipe_index))
+                voters = list(message.swipe_votes.get(idx, []))
+                if voter_clean in voters:
+                    voters.remove(voter_clean)
+                else:
+                    voters.append(voter_clean)
+                if voters:
+                    message.swipe_votes[idx] = voters
+                else:
+                    message.swipe_votes.pop(idx, None)
+                message.updated_at = utc_now()
+                chat.updated_at = utc_now()
+                self._save(chat)
+                return chat
+        raise KeyError(message_id)
+
+    def branch_chat(self, card_id: str, chat_id: str, up_to_message_id: str | None = None, title: str = "") -> BotChat:
+        source = self.get_chat(card_id, chat_id)
+        now = utc_now()
+        branched = source.model_copy(deep=True)
+        branched.id = str(uuid4())
+        branched.parent_chat_id = source.id
+        branched.branched_from_message_id = up_to_message_id or ""
+        branched.created_at = now
+        branched.updated_at = now
+        if up_to_message_id:
+            cutoff_messages: list[BotChatMessage] = []
+            found = False
+            for msg in source.messages:
+                cutoff_messages.append(msg.model_copy(deep=True))
+                if msg.id == up_to_message_id:
+                    found = True
+                    break
+            if not found:
+                raise KeyError(up_to_message_id)
+            branched.messages = cutoff_messages
+        else:
+            branched.messages = [msg.model_copy(deep=True) for msg in source.messages]
+        if branched.memory_summarized_count > len(branched.messages):
+            branched.memory_summarized_count = len(branched.messages)
+        branched.title = title.strip() or f"🌿 {source.title} ({len(branched.messages)} сообщ.)"
+        self._save(branched)
+        return branched
+
+    def roll_dice_message(self, card_id: str, chat_id: str, request: ChatDiceRollRequest) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        raw_formula = (request.formula or "1d20").strip()
+        label = request.label.strip()
+        dc = request.dc
+        dc_match = re.search(r"\bDC\s*(\d+)\b", raw_formula, flags=re.IGNORECASE)
+        if dc_match and dc is None:
+            dc = int(dc_match.group(1))
+            raw_formula = (raw_formula[:dc_match.start()] + raw_formula[dc_match.end():]).strip()
+        if not label and " " in raw_formula:
+            parts = raw_formula.split(" ", 1)
+            if re.match(r"^\d*d\d+(?:[+-]\d+)?$", parts[0].strip(), flags=re.IGNORECASE):
+                raw_formula = parts[0].strip()
+                label = parts[1].strip(" []()")
+        m = re.match(r"^(\d*)d(\d+)([+-]\d+)?$", raw_formula.replace(" ", ""), flags=re.IGNORECASE)
+        if m:
+            count = min(50, max(1, int(m.group(1) or "1")))
+            sides = min(1000, max(2, int(m.group(2))))
+            modifier = int(m.group(3) or "0")
+            formula_str = f"{count}d{sides}{f'{modifier:+d}' if modifier else ''}"
+        else:
+            count, sides, modifier = 1, 20, 0
+            formula_str = "1d20"
+        rolls = [random.randint(1, sides) for _ in range(count)]
+        total = sum(rolls) + modifier
+        success: bool | None = (total >= dc) if dc is not None else None
+        rolls_str = ", ".join(str(r) for r in rolls)
+        mod_str = f" {'+' if modifier > 0 else '-'} {abs(modifier)}" if modifier else ""
+        label_str = f" ({label})" if label else ""
+        dc_str = f" vs DC {dc} — {'УСПЕХ!' if success else 'ПРОВАЛ'}" if dc is not None else ""
+        content = f"🎲 {request.author.strip() or 'Player'} бросает {formula_str}{label_str}: [{rolls_str}]{mod_str} = {total}{dc_str}"
+        dice_data = {
+            "formula": formula_str,
+            "rolls": rolls,
+            "modifier": modifier,
+            "total": total,
+            "label": label,
+            "dc": dc,
+            "success": success,
+        }
+        chat.messages.append(
+            BotChatMessage(
+                role="user",
+                author=request.author.strip() or "Player",
+                participant_id=request.participant_id.strip(),
+                avatar_url=request.avatar_url.strip(),
+                username=request.username.strip(),
+                is_admin=request.is_admin,
+                content=content,
+                is_dice_roll=True,
+                dice_data=dice_data,
+            )
+        )
+        chat.updated_at = utc_now()
+        self._save(chat)
+        return chat
+
+    def update_party_hud(self, card_id: str, chat_id: str, hud: PartyHudState) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        chat.party_hud = hud
+        chat.updated_at = utc_now()
+        self._save(chat)
+        return chat
+
+    def update_chat_memory(self, card_id: str, chat_id: str, memory_summary: str, summarized_count: int | None = None) -> BotChat:
+        chat = self.get_chat(card_id, chat_id)
+        chat.memory_summary = memory_summary.strip()
+        if summarized_count is not None:
+            chat.memory_summarized_count = max(0, int(summarized_count))
+        chat.last_summarized_at = utc_now() if chat.memory_summary else ""
+        chat.updated_at = utc_now()
+        self._save(chat)
+        return chat
 
     def _card_chat_dir(self, card_id: str) -> Path:
         safe_id = self._safe_path_part(card_id)
