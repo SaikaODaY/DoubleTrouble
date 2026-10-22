@@ -3994,10 +3994,10 @@ export default function App() {
                 <div className="popover-section-title">Онлайн в комнате ({currentRoomId})</div>
                 <div className="players-pill-list">
                   {connectedPlayers.length ? connectedPlayers.map((player) => (
-                    <span className="player-pill" key={player.id} title={player.persona_name || player.name}>
-                      {player.avatar_url && visual.showAvatars ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(player.avatar_url), title: player.persona_name || player.name })}><img src={imageSrc(player.avatar_url)} alt="" loading="lazy" /></button> : <span className="online-dot" />}
-                      <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.name}</span></strong>
-                      {player.username ? <small className="hover-username">({player.username})</small> : null}
+                    <span className="player-pill" key={player.id} title={player.username ? `${player.persona_name || player.name} (@${player.username})` : (player.persona_name || player.name)}>
+                      <span className="online-dot" />
+                      <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.username || player.name}</span></strong>
+                      {player.username && (player.persona_name || player.name) && player.username.toLowerCase() !== (player.persona_name || player.name).toLowerCase() ? <small className="hover-username">({player.username})</small> : null}
                     </span>
                   )) : <strong>{t('topbar.players.none')}</strong>}
                 </div>

@@ -323,15 +323,15 @@ class GenerationService:
         visible_history = [message for message in history if not message.hidden and not getattr(message, "is_ooc", False)]
         persona_name = persona_name or next((message.author for message in reversed(visible_history) if message.role == "user" and message.author), "User")
         history_messages = self._history_messages(visible_history, openai_preset, multi_user_mode, character_name, persona_name)
-        messages = self._tavern_openai_messages(openai_preset, character_name, persona_name, persona_description or "", character_data or {}, history_messages, world_info or {})
+        messages = self._tavern_openai_messages(openai_preset, character_name, persona_name, persona_description or "", character_data or {}, history_messages, world_info or {}, multi_user_mode=multi_user_mode)
         if not messages:
             messages = self._default_prompt_assembly(character_name, persona_name, persona_description or "", character_data or {}, history_messages, world_info or {})
         if len(messages) == 1 and not history_messages:
             messages.append(ChatMessage(role="user", content="Begin the scene."))
+        messages = [m for m in messages if m.content and m.content.strip()]
         if isinstance(openai_preset, dict) and bool(openai_preset.get("squash_system_messages")):
             messages = self._squash_system_messages(messages)
-        return self._pack_tavern_messages(messages)
-
+        return messages
     def _default_prompt_assembly(self, character_name: str, persona_name: str, persona_description: str, character_data: dict[str, Any], history_messages: list[ChatMessage], world_info: dict[str, Any]) -> list[ChatMessage]:
         result: list[ChatMessage] = []
         parts: list[str] = []
@@ -352,15 +352,17 @@ class GenerationService:
             parts.append(substituted_persona)
         world_before = self._substitute_prompt(str(world_info.get("worldInfoBefore") or "").strip(), character_name, persona_name)
         if world_before:
-            parts.append(world_before)
+            parts.insert(1 if char_sys else 0, world_before)
+        world_after = self._substitute_prompt(str(world_info.get("worldInfoAfter") or "").strip(), character_name, persona_name)
+        if world_after:
+            parts.append(world_after)
         if parts:
             result.append(ChatMessage(role="system", content="\n\n".join(parts)))
         examples = self._dialogue_example_messages(character_data, {}, character_name, persona_name)
         result.extend(examples)
+        if history_messages:
+            result.append(ChatMessage(role="system", content="[Start a new Chat]"))
         result.extend(history_messages)
-        world_after = self._substitute_prompt(str(world_info.get("worldInfoAfter") or "").strip(), character_name, persona_name)
-        if world_after:
-            result.append(ChatMessage(role="system", content=world_after))
         post_hist = self._substitute_prompt(str(character_data.get("post_history_instructions") or "").strip(), character_name, persona_name)
         if post_hist:
             result.append(ChatMessage(role="system", content=post_hist))
@@ -386,7 +388,10 @@ class GenerationService:
         for message in selected_history:
             role = "assistant" if message.role == "assistant" else "user"
             msg_user = (message.author or persona_name) if role == "user" else persona_name
-            content = self._substitute_prompt(message.content, character_name, msg_user)
+            raw_content = self._strip_reasoning_from_history(message.content, preset) if role == "assistant" else message.content
+            content = self._substitute_prompt(raw_content, character_name, msg_user)
+            if not content.strip():
+                continue
             name = None
             if getattr(message, "is_secret", False) and not getattr(message, "secret_revealed", False) and role == "user":
                 content = f"[Secret action by {message.author or 'Player'} (hidden from other players): {content}]"
@@ -400,7 +405,21 @@ class GenerationService:
                 name = self._sanitize_openai_name(message.author)
             messages.append(ChatMessage(role=role, content=content, name=name))
         return messages
-    def _tavern_openai_messages(self, preset: dict[str, Any] | None, character_name: str, persona_name: str, persona_description: str, character_data: dict[str, Any], history_messages: list[ChatMessage], world_info: dict[str, Any]) -> list[ChatMessage]:
+
+    def _strip_reasoning_from_history(self, content: str, preset: dict[str, Any] | None = None) -> str:
+        if not content:
+            return ""
+        if isinstance(preset, dict) and bool(preset.get("reasoning_add_to_prompts")):
+            return content
+        cleaned = re.sub(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>\s*", "", content, flags=re.IGNORECASE)
+        if isinstance(preset, dict):
+            r_prefix = str(preset.get("reasoning_prefix") or "").strip()
+            r_suffix = str(preset.get("reasoning_suffix") or "").strip()
+            if r_prefix and r_suffix:
+                cleaned = re.sub(rf"{re.escape(r_prefix)}[\s\S]*?{re.escape(r_suffix)}\s*", "", cleaned)
+        return cleaned.strip() or content.strip()
+
+    def _tavern_openai_messages(self, preset: dict[str, Any] | None, character_name: str, persona_name: str, persona_description: str, character_data: dict[str, Any], history_messages: list[ChatMessage], world_info: dict[str, Any], multi_user_mode: bool = False) -> list[ChatMessage]:
         if not isinstance(preset, dict):
             return []
 
@@ -431,23 +450,38 @@ class GenerationService:
                 else:
                     absolute_prompts.append({"role": ep_role, "content": ep_text, "injection_position": 1, "injection_depth": self._int_value(ext_prompt.get("depth"), 4), "injection_order": 100})
         inserted_history = False
+        inserted_jailbreak = False
         for prompt in prompts:
             identifier = str(prompt.get("identifier") or "")
             if self._int_value(prompt.get("injection_position"), 0) == 1:
                 continue
             if identifier == "chatHistory":
+                if history_messages:
+                    raw_new_chat = str(preset.get("new_group_chat_prompt") if multi_user_mode else preset.get("new_chat_prompt") or "[Start a new Chat]").strip()
+                    if raw_new_chat:
+                        new_chat_text = self._substitute_prompt(raw_new_chat.replace("{{group}}", persona_name), character_name, persona_name)
+                        if new_chat_text:
+                            messages.append(ChatMessage(role="system", content=new_chat_text))
                 messages.extend(self._with_tavern_in_chat_injections(history_messages, absolute_prompts, character_name, persona_name, persona_description, character_data, preset, world_info))
                 inserted_history = True
                 continue
             if identifier == "dialogueExamples":
                 messages.extend(self._dialogue_example_messages(character_data, preset, character_name, persona_name))
                 continue
+            if identifier == "jailbreak":
+                inserted_jailbreak = True
             content = self._prompt_content(prompt, character_name, persona_name, persona_description, character_data, preset, world_info)
             if content:
                 messages.append(ChatMessage(role=self._prompt_role(prompt), content=content))
 
         if not inserted_history:
             messages.extend(self._with_tavern_in_chat_injections(history_messages, absolute_prompts, character_name, persona_name, persona_description, character_data, preset, world_info))
+        if not inserted_jailbreak and preset.get("prefer_character_jailbreak", True) is not False:
+            post_hist = str(character_data.get("post_history_instructions") or "").strip()
+            if post_hist:
+                cleaned_post = re.sub(r"\{\{original\}\}", "", post_hist, flags=re.IGNORECASE).strip()
+                if cleaned_post:
+                    messages.append(ChatMessage(role="system", content=self._substitute_prompt(cleaned_post, character_name, persona_name)))
         return messages
 
     def _prompt_collection(self, preset: dict[str, Any], character_data: dict[str, Any], persona_description: str) -> list[dict[str, Any]]:
@@ -506,18 +540,39 @@ class GenerationService:
             content = self._marker_content(identifier, character_data, persona_description, preset, world_info or {})
         else:
             content = str(prompt.get("content") or "")
+            if identifier == "main" and preset.get("prefer_character_prompt", True) is not False:
+                char_sys = str(character_data.get("system_prompt") or "").strip()
+                if char_sys:
+                    if re.search(r"\{\{original\}\}", char_sys, flags=re.IGNORECASE):
+                        content = re.sub(r"\{\{original\}\}", content, char_sys, flags=re.IGNORECASE)
+                    else:
+                        content = f"{content.strip()}\n\n{char_sys}".strip() if content.strip() else char_sys
+            elif identifier == "jailbreak" and preset.get("prefer_character_jailbreak", True) is not False:
+                post_hist = str(character_data.get("post_history_instructions") or "").strip()
+                if post_hist:
+                    if re.search(r"\{\{original\}\}", post_hist, flags=re.IGNORECASE):
+                        content = re.sub(r"\{\{original\}\}", content, post_hist, flags=re.IGNORECASE)
+                    else:
+                        content = f"{content.strip()}\n\n{post_hist}".strip() if content.strip() else post_hist
         return self._substitute_prompt(content.strip(), character_name, persona_name)
 
     def _dialogue_example_messages(self, character_data: dict[str, Any], preset: dict[str, Any], character_name: str, persona_name: str) -> list[ChatMessage]:
         raw_examples = str(character_data.get("mes_example") or "").strip()
         if not raw_examples:
             return []
-        messages = [ChatMessage(role="system", content=self._substitute_prompt(str(preset.get("new_example_chat_prompt") or "[Example Chat]"), character_name, persona_name))]
-        parsed = self._parse_dialogue_examples(raw_examples, character_name, persona_name)
-        if parsed:
-            messages.extend(parsed)
-        else:
-            messages.append(ChatMessage(role="system", content=self._substitute_prompt(raw_examples, character_name, persona_name)))
+        header_text = self._substitute_prompt(str(preset.get("new_example_chat_prompt") or "[Example Chat]"), character_name, persona_name)
+        blocks = [b.strip() for b in re.split(r"<START>", raw_examples, flags=re.IGNORECASE) if b.strip()]
+        if not blocks:
+            return []
+        messages: list[ChatMessage] = []
+        for block in blocks:
+            if header_text:
+                messages.append(ChatMessage(role="system", content=header_text))
+            parsed = self._parse_dialogue_examples(block, character_name, persona_name)
+            if parsed:
+                messages.extend(parsed)
+            else:
+                messages.append(ChatMessage(role="system", content=self._substitute_prompt(block, character_name, persona_name)))
         return messages
 
     def _parse_dialogue_examples(self, raw_examples: str, character_name: str, persona_name: str) -> list[ChatMessage]:
@@ -533,15 +588,18 @@ class GenerationService:
             current_role = ""
             current_lines = []
 
+        user_prefixes = (f"{persona_name.lower()}:", "{{user}}:", "{user}:", "<user>:")
+        char_prefixes = (f"{character_name.lower()}:", "{{char}}:", "{char}:", "<bot>:", "<char>:")
         for line in raw_examples.replace("\r", "").split("\n"):
             stripped = line.strip()
             if not stripped or stripped.upper().startswith("<START>"):
                 continue
-            if stripped.startswith(f"{persona_name}:") or stripped.startswith("{{user}}:"):
+            lowered = stripped.lower()
+            if any(lowered.startswith(p) for p in user_prefixes):
                 flush()
                 current_role = "user"
                 current_lines.append(stripped.split(":", 1)[1].strip())
-            elif stripped.startswith(f"{character_name}:") or stripped.startswith("{{char}}:"):
+            elif any(lowered.startswith(p) for p in char_prefixes):
                 flush()
                 current_role = "assistant"
                 current_lines.append(stripped.split(":", 1)[1].strip())
@@ -666,9 +724,9 @@ class GenerationService:
             case "personaDescription":
                 return persona_description
             case "worldInfoBefore":
-                return str((world_info or {}).get("worldInfoBefore") or "")
+                return self._format_template(str(preset.get("wi_format") or "{0}"), "0", str((world_info or {}).get("worldInfoBefore") or ""))
             case "worldInfoAfter":
-                return str((world_info or {}).get("worldInfoAfter") or "")
+                return self._format_template(str(preset.get("wi_format") or "{0}"), "0", str((world_info or {}).get("worldInfoAfter") or ""))
             case _:
                 return ""
 

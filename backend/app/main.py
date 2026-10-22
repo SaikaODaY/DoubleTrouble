@@ -443,7 +443,7 @@ def _generation_persona_context(request: BotReplyRequest | None, history: list[A
         )
     history_user_authors: list[str] = []
     for msg in history or []:
-        if getattr(msg, "role", "") == "user" and not getattr(msg, "hidden", False):
+        if getattr(msg, "role", "") == "user" and not getattr(msg, "hidden", False) and not getattr(msg, "is_ooc", False):
             author = str(getattr(msg, "author", "") or "").strip()
             if author and author not in history_user_authors:
                 history_user_authors.append(author)
@@ -467,8 +467,13 @@ def _generation_persona_context(request: BotReplyRequest | None, history: list[A
         by_key[key] = (name, description)
         if primary_id and participant.persona_id == primary_id:
             primary_name = name
+    active_participant_count = len(by_key)
     for author in history_user_authors:
+        if author.lower() == "player" and by_key:
+            continue
         if any(existing_name.lower() == author.lower() for existing_name, _ in by_key.values()):
+            continue
+        if active_participant_count <= 1 and len(by_key) >= 1:
             continue
         stored = known_by_name.get(author.lower())
         pid = stored.id if stored else ""
@@ -479,11 +484,11 @@ def _generation_persona_context(request: BotReplyRequest | None, history: list[A
     personas = list(by_key.values())
     if not personas:
         return primary_name, ((request.persona_description if request else "") or "").strip() or None, False, persona_ids
-    if len(personas) == 1 and len(history_user_authors) <= 1:
+    if len(personas) == 1:
         return primary_name or personas[0][0], personas[0][1], False, persona_ids
     names_str = ", ".join(name for name, _ in personas)
     combined = (
-        f"Active player personas in this DoubleTrouble multiplayer chat ({names_str}):\n"
+        f"Active player personas in this multiplayer roleplay ({names_str}):\n"
         + "\n".join(f"- {name}: {description or 'No persona description provided.'}" for name, description in personas)
         + "\nEach user message in the chat history is prefixed with the speaker's name (e.g. 'Name: message'). Respond only as {{char}} and do not write dialogue or actions on behalf of any player persona."
     )

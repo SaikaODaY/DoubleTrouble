@@ -1190,31 +1190,22 @@ textarea {
 .player-pill {
   display: inline-flex;
   max-width: 100%;
-  gap: 0.32rem;
+  gap: 0.28rem;
   align-items: center;
-  border: 1px solid var(--border);
-  border-radius: 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  border-radius: 999px;
   background: var(--surface-2);
-  padding: 0.16rem 0.48rem;
+  padding: 0.14rem 0.52rem;
   color: var(--text);
-  font-size: 0.78rem;
+  font-size: 0.74rem;
   font-weight: 500;
+  line-height: 1.2;
 }
 
-.player-pill img,
-.player-pill i {
-  display: grid;
-  width: 1rem;
-  height: 1rem;
-  place-items: center;
-  flex: 0 0 auto;
-  border-radius: 0.28rem;
-  color: var(--teal-ink);
-  background: var(--teal);
-  font-style: normal;
-  font-size: 0.65rem;
-  font-weight: 700;
-  object-fit: cover;
+.player-pill .identity-name {
+  font-size: 0.74rem;
+  font-weight: 600;
+  gap: 0.2rem;
 }
 
 .player-pill strong {
@@ -1349,26 +1340,18 @@ textarea {
 }
 .player-pill .hover-username {
   position: static;
-  max-width: 0;
-  overflow: hidden;
+  font-size: 0.68rem;
+  opacity: 0.72;
   border: 0;
   background: transparent;
   padding: 0;
-  transition: max-width 140ms ease, opacity 120ms ease;
 }
 
 .message-author:hover .hover-username,
 .message-author:focus-within .hover-username,
 .message-name-block:hover .hover-username,
-.message-name-block:focus-within .hover-username,
-.player-pill:hover .hover-username,
-.player-pill:focus-within .hover-username {
+.message-name-block:focus-within .hover-username {
   opacity: 0.78;
-}
-
-.player-pill:hover .hover-username,
-.player-pill:focus-within .hover-username {
-  max-width: 10rem;
 }
 
 .avatar-preview-button {

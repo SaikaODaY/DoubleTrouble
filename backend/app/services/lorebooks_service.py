@@ -198,7 +198,8 @@ class LorebooksService:
                 all_candidates.append(entry)
 
         activated_indices: set[int] = set()
-        scan_text = "\n".join(history)
+        recent_history = [re.sub(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>", "", text, flags=re.IGNORECASE) for text in history[-16:]]
+        scan_text = "\n".join(recent_history)
         for _pass in range(3):
             newly_added: list[str] = []
             for idx, entry in enumerate(all_candidates):

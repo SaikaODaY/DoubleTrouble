@@ -127,15 +127,15 @@
                     "enabled": true
                 },
                 {
+                    "identifier": "worldInfoAfter",
+                    "enabled": true
+                },
+                {
                     "identifier": "dialogueExamples",
                     "enabled": true
                 },
                 {
                     "identifier": "chatHistory",
-                    "enabled": true
-                },
-                {
-                    "identifier": "worldInfoAfter",
                     "enabled": true
                 },
                 {
@@ -172,15 +172,15 @@
                     "enabled": true
                 },
                 {
+                    "identifier": "worldInfoAfter",
+                    "enabled": true
+                },
+                {
                     "identifier": "dialogueExamples",
                     "enabled": true
                 },
                 {
                     "identifier": "chatHistory",
-                    "enabled": true
-                },
-                {
-                    "identifier": "worldInfoAfter",
                     "enabled": true
                 },
                 {
