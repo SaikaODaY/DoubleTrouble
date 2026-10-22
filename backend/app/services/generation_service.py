@@ -267,6 +267,7 @@ class GenerationService:
             value = str(preset.get(key) or "").strip()
             if value and value not in {"auto", "disabled"}:
                 parameters[key] = value
+        parameters["__show_thoughts"] = self._bool_from_preset(preset, "show_thoughts", True)
         custom_body = self._custom_body(preset.get("custom_include_body"))
         if custom_body:
             parameters.update(custom_body)

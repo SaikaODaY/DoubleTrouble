@@ -530,6 +530,7 @@ export default {
   'permissions.viewChats': 'View chats',
   'permissions.viewPresets': 'View presets',
   'permissions.viewLorebooks': 'View lorebooks',
+  'permissions.viewReasoning': 'View bot reasoning',
   'permissions.editCards': 'Create and edit cards',
   'permissions.deleteCards': 'Delete cards',
   'permissions.editPersonas': 'Create and edit personas',

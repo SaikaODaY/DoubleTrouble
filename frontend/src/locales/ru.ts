@@ -531,6 +531,7 @@ export default {
   'permissions.viewChats': 'Просмотр чатов',
   'permissions.viewPresets': 'Просмотр пресетов',
   'permissions.viewLorebooks': 'Просмотр лорбуков',
+  'permissions.viewReasoning': 'Показ размышлений бота',
   'permissions.editCards': 'Создание и правка карточек',
   'permissions.deleteCards': 'Удаление карточек',
   'permissions.editPersonas': 'Создание и правка персон',

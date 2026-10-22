@@ -68,9 +68,13 @@ class OpenAICompatibleProvider:
             response.raise_for_status()
             data = response.json()
 
+        show_thoughts = request.parameters.get("__show_thoughts", True) is not False
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         content = message.get("content") or choice.get("text") or ""
+        reasoning = (message.get("reasoning_content") or message.get("reasoning") or "") if show_thoughts else ""
+        if isinstance(reasoning, str) and reasoning.strip() and "<think>" not in str(content):
+            content = f"<think>\n{reasoning.strip()}\n</think>\n\n{content or ''}"
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("LLM provider returned an empty response")
         return content.strip()
@@ -98,17 +102,31 @@ class OpenAICompatibleProvider:
                 if response.status_code >= 400:
                     await response.aread()
                 response.raise_for_status()
+                show_thoughts = request.parameters.get("__show_thoughts", True) is not False
                 emitted = False
+                in_reasoning = False
                 raw_lines: list[str] = []
                 async for line in response.aiter_lines():
                     raw_lines.append(line)
                     stripped = line.strip()
                     if not stripped or stripped.startswith(":"):
                         continue
-                    token = self._stream_token(stripped)
-                    if token:
+                    r_tok, c_tok = self._stream_parts(stripped)
+                    if show_thoughts and r_tok:
+                        if not in_reasoning:
+                            in_reasoning = True
+                            yield "<think>\n"
                         emitted = True
-                        yield token
+                        yield r_tok
+                    if c_tok:
+                        if in_reasoning:
+                            in_reasoning = False
+                            yield "\n</think>\n\n"
+                        emitted = True
+                        yield c_tok
+                if in_reasoning:
+                    in_reasoning = False
+                    yield "\n</think>\n\n"
                 if not emitted and raw_lines:
                     joined = "\n".join(raw_lines)
                     for event in self._remaining_stream_events(joined):
@@ -122,6 +140,7 @@ class OpenAICompatibleProvider:
                             yield content
     def _request_body(self, request: GenerationRequest, stream: bool) -> dict[str, Any]:
         parameters = dict(request.parameters)
+        parameters.pop("__show_thoughts", None)
         excluded_body_keys = {str(key) for key in parameters.pop("__exclude_body_keys", [])}
         body: dict[str, Any] = {
             "model": request.model,
@@ -223,6 +242,21 @@ class OpenAICompatibleProvider:
             return "\n".join(data_lines).strip()
         return event.strip()
 
+    def _stream_parts(self, event: str) -> tuple[str, str]:
+        payload = self._event_data(event)
+        if not payload or payload == "[DONE]":
+            return "", ""
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return "", ""
+        choice = (data.get("choices") or [{}])[0]
+        choice = choice if isinstance(choice, dict) else {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+        reasoning_str = reasoning if isinstance(reasoning, str) else ""
+        return reasoning_str, self._stream_content(data)
+
     def _stream_content(self, data: dict[str, Any]) -> str:
         choice = (data.get("choices") or [{}])[0]
         choice = choice if isinstance(choice, dict) else {}
@@ -245,7 +279,6 @@ class OpenAICompatibleProvider:
         if isinstance(content, list):
             return "".join(str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content)
         return content if isinstance(content, str) else ""
-
     def _candidate_text(self, data: dict[str, Any]) -> str:
         parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
         return "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict) and not part.get("thought"))

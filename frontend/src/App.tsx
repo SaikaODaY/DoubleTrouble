@@ -8,7 +8,7 @@ import { loadMagicTranslationSettings, translateText } from './magicTranslationE
 import { useLocaleContext, type Language } from './localization';
 
 type MenuSection = 'presets' | 'connection' | 'visual' | 'personas' | 'security' | 'lorebooks' | 'cards' | 'extensions';
-type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot' | 'lock' | 'key' | 'menu' | 'send' | 'edit' | 'trash' | 'eye' | 'eyeOff' | 'check' | 'x';
+type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot' | 'lock' | 'key' | 'menu' | 'send' | 'edit' | 'trash' | 'eye' | 'eyeOff' | 'check' | 'x' | 'branch' | 'translate';
 type ThemeId = 'midnight' | 'parchment' | 'abyss' | 'forest' | 'ocean' | 'plum' | 'ember' | 'aurora' | 'rose' | 'slate' | 'noir' | 'cyberpunk' | 'dracula' | 'nord' | 'coffee' | 'porcelain' | 'mint' | 'lavender' | 'solar' | 'sand' | 'linen' | 'cloud' | 'buttercream' | 'seashell' | 'morning' | 'paper';
 type VisualSettings = {
   theme: ThemeId;
@@ -387,8 +387,8 @@ function getPermissionLabels(t: (key: string) => string): Record<string, string>
     view_chats: t('permissions.viewChats'),
     view_presets: t('permissions.viewPresets'),
     view_lorebooks: t('permissions.viewLorebooks'),
+    view_reasoning: t('permissions.viewReasoning'),
     edit_cards: t('permissions.editCards'),
-    delete_cards: t('permissions.deleteCards'),
     edit_personas: t('permissions.editPersonas'),
     delete_personas: t('permissions.deletePersonas'),
     manage_chats: t('permissions.manageChats'),
@@ -403,7 +403,7 @@ function getPermissionLabels(t: (key: string) => string): Record<string, string>
   };
 }
 
-const defaultSecurityPermissionKeys = ['view_cards', 'view_personas', 'view_chats', 'view_presets', 'view_lorebooks', 'edit_cards', 'delete_cards', 'edit_personas', 'delete_personas', 'manage_chats', 'edit_messages', 'delete_messages', 'generate', 'manage_presets', 'manage_lorebooks', 'manage_extensions', 'manage_keys', 'manage_security'];
+const defaultSecurityPermissionKeys = ['view_cards', 'view_personas', 'view_chats', 'view_presets', 'view_lorebooks', 'view_reasoning', 'edit_cards', 'delete_cards', 'edit_personas', 'delete_personas', 'manage_chats', 'edit_messages', 'delete_messages', 'generate', 'manage_presets', 'manage_lorebooks', 'manage_extensions', 'manage_keys', 'manage_security'];
 const defaultSecurityPermissions: SecurityPermissions = Object.fromEntries(defaultSecurityPermissionKeys.map((key) => [key, { mode: key === 'manage_security' || key === 'manage_keys' ? 'admins' : 'everyone', users: [] }])) as SecurityPermissions;
 const defaultDeletionLocks: DeletionLocks = { cards: [], personas: [], chats: [] };
 const defaultBuiltInExtensionSettings: BuiltInExtensionSettings = { noriMynInfoblock: true, magicTranslation: true };
@@ -911,6 +911,17 @@ export default function App() {
   const [pendingDeleteKey, setPendingDeleteKey] = useState('');
   const activeMessages = activeChat?.messages ?? [];
   const reasoningDisplay = useMemo(() => reasoningSettingsFromPreset(parsePresetDraft(presetJsonDraft)), [presetJsonDraft]);
+  const canViewReasoning = useMemo(() => {
+    const rule = securityPermissions.view_reasoning || { mode: 'everyone', users: [] };
+    if (rule.mode === 'everyone') return true;
+    if (!authUser) return false;
+    if (authUser.is_admin) return true;
+    if (rule.mode === 'users') {
+      const allowed = new Set((rule.users || []).map((u) => u.trim().toLowerCase()).filter(Boolean));
+      return allowed.has(authUser.username.trim().toLowerCase());
+    }
+    return false;
+  }, [securityPermissions.view_reasoning, authUser]);
   const selectedPersona = useMemo(() => personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null, [personas, selectedPersonaId]);
   const connectedPlayers = useMemo(() => {
     const byKey = new Map<string, Participant>();
@@ -3262,7 +3273,7 @@ export default function App() {
     setActiveChat(data.chat);
     rememberChatSelection(activeCard.id, data.chat.id);
     await refreshCardChats(activeCard.id);
-    addToast(`🌿 Открыта новая ветка: ${data.chat.title}`);
+    addToast(`⑂ Открыта новая ветка: ${data.chat.title}`);
   };
 
   const toggleSwipeVote = async (message: ChatMessage) => {
@@ -3984,7 +3995,7 @@ export default function App() {
                 <div className="players-pill-list">
                   {connectedPlayers.length ? connectedPlayers.map((player) => (
                     <span className="player-pill" key={player.id} title={player.persona_name || player.name}>
-                      {player.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(player.avatar_url), title: player.persona_name || player.name })}><img src={imageSrc(player.avatar_url)} alt="" loading="lazy" /></button> : <i>{(player.persona_name || player.name).slice(0, 1) || '?'}</i>}
+                      {player.avatar_url && visual.showAvatars ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(player.avatar_url), title: player.persona_name || player.name })}><img src={imageSrc(player.avatar_url)} alt="" loading="lazy" /></button> : <span className="online-dot" />}
                       <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.name}</span></strong>
                       {player.username ? <small className="hover-username">({player.username})</small> : null}
                     </span>
@@ -4204,9 +4215,9 @@ export default function App() {
                     </button>
                   ) : null}
                   {message.role === 'assistant' ? <button className="mes_button" type="button" title={t('message.swipe.new')} onClick={() => void requestBotReply(message.id)}>↻</button> : null}
-                  <button className="mes_button" type="button" title="Создать ветку сюжета отсюда 🌿" onClick={() => void branchChatFromMessage(message.id)}>🌿</button>
+                  <button className="mes_button" type="button" title="Создать развилку сюжета (новую ветку чата) с этого сообщения" onClick={() => void branchChatFromMessage(message.id)}><Icon name="branch" /></button>
                   {isImagePending ? <button className="mes_button" type="button" title={t('message.cancelImage')} onClick={() => cancelImageGeneration(messageIndex, message)}><Icon name="x" /></button> : null}
-                  <button className="mes_button" type="button" title={t('message.translate')} onClick={() => void handleMagicTranslateMessage(message)}>🌐</button>
+                  <button className="mes_button" type="button" title={t('message.translate')} onClick={() => void handleMagicTranslateMessage(message)}><Icon name="translate" /></button>
                   {!isSecretHiddenForMe ? <button className="mes_button" type="button" title={t('message.edit')} onClick={() => startEditMessage(message)}><Icon name="edit" /></button> : null}
                   <button className="mes_button" type="button" title={message.hidden ? t('common.show') : t('common.hide')} onClick={() => void toggleMessageHidden(message)}><Icon name={message.hidden ? 'eye' : 'eyeOff'} /></button>
                   <button className="mes_button" type="button" title={t('message.delete')} onClick={() => void deleteChatMessage(message)}><Icon name="trash" /></button>
@@ -4240,7 +4251,7 @@ export default function App() {
                     </div>
                   ) : (
                     <>
-                      <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}:${regexRenderTick}`} content={visibleMessageContent} role={message.role} reasoning={reasoningDisplay} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />
+                      <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}:${regexRenderTick}`} content={visibleMessageContent} role={message.role} reasoning={reasoningDisplay} showReasoning={canViewReasoning} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />
                       {rollPrompts.length > 0 ? (
                         <div className="bot-roll-prompts">
                           {rollPrompts.map((rawSpec, rIdx) => {
@@ -4278,7 +4289,7 @@ export default function App() {
                   <header>
                     <span className="message-name-block"><strong className="identity-name"><span>{activeCard?.name || t('composer.bot')}</span></strong></span>
                   </header>
-                  {(displayedStreamText || generationStreamText) ? <MessageContent content={`${displayedStreamText || generationStreamText}▍`} role="assistant" reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
+                  {(displayedStreamText || generationStreamText) ? <MessageContent content={`${displayedStreamText || generationStreamText}▍`} role="assistant" reasoning={reasoningDisplay} showReasoning={canViewReasoning} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
                 </div>
               </article>
             ) : null}
@@ -7628,23 +7639,23 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
   );
 }
 
-const MessageContent = memo(function MessageContent({ content, role = 'assistant', reasoning, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; role?: string; reasoning: ReasoningDisplaySettings; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
+const MessageContent = memo(function MessageContent({ content, role = 'assistant', reasoning, showReasoning = true, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; role?: string; reasoning: ReasoningDisplaySettings; showReasoning?: boolean; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
   const { t } = useLocaleContext();
   const displayPlacement = role === 'user' ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
   const regexedContent = getRegexedString(content, displayPlacement, { isMarkdown: true });
-  const parsed = reasoning.autoParse ? splitReasoning(regexedContent, reasoning) : { reasoning: '', visible: regexedContent, complete: false };
-  const reasoningText = parsed.reasoning ? getRegexedString(parsed.reasoning, regex_placement.REASONING, { isMarkdown: true }) : '';
+  const parsed = reasoning.autoParse || !showReasoning ? splitReasoning(regexedContent, reasoning) : { reasoning: '', visible: regexedContent, complete: false };
+  const reasoningText = showReasoning && parsed.reasoning ? getRegexedString(parsed.reasoning, regex_placement.REASONING, { isMarkdown: true }) : '';
   const formatOptions: ExtensionMessageFormatOptions = { forceImagePending: imagePending, renderPendingMarkersAsSpinner, reasoning, t };
   const reasoningOpen = isStreaming ? Boolean(reasoningText && !parsed.complete) : reasoning.autoExpand;
   return (
     <div className="message-content mes_text">
-      {reasoningText && !reasoning.showHidden ? (
+      {showReasoning && reasoningText && !reasoning.showHidden ? (
         <details className="reasoning-block" open={reasoningOpen}>
           <summary>{t('reasoning.thinking')}</summary>
           <pre>{reasoningText}</pre>
         </details>
       ) : null}
-      {reasoningText && reasoning.showHidden ? <pre className="reasoning-visible">{reasoningText}</pre> : null}
+      {showReasoning && reasoningText && reasoning.showHidden ? <pre className="reasoning-visible">{reasoningText}</pre> : null}
       {formatMessageText(parsed.visible, formatOptions, true)}
     </div>
   );
@@ -7685,16 +7696,19 @@ function reasoningTemplateName(settings: ReasoningDisplaySettings): string {
 }
 
 function splitReasoning(content: string, settings: ReasoningDisplaySettings): { reasoning: string; visible: string; complete: boolean } {
-  if (!settings.prefix || !settings.suffix) {
-    return { reasoning: '', visible: content, complete: false };
-  }
-  const prefix = findReasoningMarker(content, [settings.prefix, settings.prefix.trim()], 0);
+  const prefixes = settings.prefix && settings.suffix
+    ? [settings.prefix, settings.prefix.trim()]
+    : ['<think>\n', '<think>', '<thinking>\n', '<thinking>'];
+  const suffixes = settings.prefix && settings.suffix
+    ? [settings.suffix, settings.suffix.trim()]
+    : ['\n</think>', '</think>', '\n</thinking>', '</thinking>'];
+  const prefix = findReasoningMarker(content, prefixes, 0);
   const start = prefix.index;
   if (start < 0) {
     return { reasoning: '', visible: content, complete: false };
   }
   const bodyStart = start + prefix.marker.length;
-  const suffix = findReasoningMarker(content, [settings.suffix, settings.suffix.trim()], bodyStart);
+  const suffix = findReasoningMarker(content, suffixes, bodyStart);
   const end = suffix.index;
   if (end < 0) {
     return { reasoning: content.slice(bodyStart), visible: content.slice(0, start).trim(), complete: false };
@@ -8431,6 +8445,25 @@ function Icon({ name }: { name: IconName }) {
       <>
         <path d="M18 6 6 18" />
         <path d="M6 6l12 12" />
+      </>
+    ),
+    branch: (
+      <>
+        <circle cx="6" cy="6" r="2.5" />
+        <circle cx="18" cy="8" r="2.5" />
+        <circle cx="6" cy="18" r="2.5" />
+        <path d="M6 8.5v7" />
+        <path d="M18 10.5c0 4-3 5-12 5" />
+      </>
+    ),
+    translate: (
+      <>
+        <path d="m5 8 6 6" />
+        <path d="m4 14 6-6 2-3" />
+        <path d="M2 5h12" />
+        <path d="M7 2h1" />
+        <path d="m22 22-5-10-5 10" />
+        <path d="M14 18h6" />
       </>
     ),
   };

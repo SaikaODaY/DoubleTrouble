@@ -64,6 +64,7 @@ class SecurityPermissions(BaseModel):
     view_chats: PermissionRule = Field(default_factory=PermissionRule)
     view_presets: PermissionRule = Field(default_factory=PermissionRule)
     view_lorebooks: PermissionRule = Field(default_factory=PermissionRule)
+    view_reasoning: PermissionRule = Field(default_factory=PermissionRule)
     edit_cards: PermissionRule = Field(default_factory=PermissionRule)
     delete_cards: PermissionRule = Field(default_factory=PermissionRule)
     edit_personas: PermissionRule = Field(default_factory=PermissionRule)
