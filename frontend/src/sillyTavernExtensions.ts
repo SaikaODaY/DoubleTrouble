@@ -44,10 +44,15 @@ type RuntimeState = {
   activePersonas: RuntimePersona[];
   selectedPersonaId: string;
   characterId?: number;
+  chatId?: string;
   name1: string;
   name2: string;
   getRequestHeaders: () => Record<string, string>;
   saveMessageByIndex: (index: number, content: string, expectedMessageId?: string) => Promise<void>;
+  addMessage?: (role: 'user' | 'assistant' | 'system', content: string, author?: string) => Promise<void>;
+  deleteLastMessage?: () => Promise<void>;
+  reloadChat?: () => Promise<void>;
+  stopGeneration?: () => Promise<void>;
   toast: (message: string) => void;
   extensionLeader: boolean;
   reasoning: RuntimeReasoningSettings;
@@ -59,6 +64,10 @@ type EventHandlerRecord = { handler: EventHandler; owner: string };
 const SETTINGS_STORAGE_KEY = 'doubletrouble.sillyTavernExtensionSettings';
 const loadedExtensionScripts = new Set<string>();
 const loadedExtensionStyles = new Set<string>();
+const templateCache = new Map<string, string>();
+const chatMetadata: Record<string, unknown> = {};
+const extensionPrompts: Record<string, { value: string; position: number; depth: number; scan: boolean; role: number }> = {};
+const registeredMacros = new Map<string, string | (() => unknown)>();
 let loadingExtensionName = '';
 
 const eventTypes = {
@@ -68,8 +77,21 @@ const eventTypes = {
   CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
   MESSAGE_SWIPED: 'message_swiped',
   MESSAGE_UPDATED: 'message_updated',
+  MESSAGE_EDITED: 'message_edited',
+  MESSAGE_DELETED: 'message_deleted',
+  MESSAGE_RECEIVED: 'message_received',
+  MESSAGE_SENT: 'message_sent',
+  GENERATION_STARTED: 'generation_started',
+  GENERATION_STOPPED: 'generation_stopped',
+  GENERATION_ENDED: 'generation_ended',
+  GENERATION_AFTER_COMMANDS: 'GENERATION_AFTER_COMMANDS',
+  CHARACTER_FIRST_MESSAGE_SELECTED: 'character_first_message_selected',
+  SETTINGS_UPDATED: 'settings_updated',
+  SETTINGS_LOADED: 'settings_loaded',
+  EXTRAS_CONNECTED: 'extras_connected',
+  WORLD_INFO_ACTIVATED: 'world_info_activated',
+  GROUP_UPDATED: 'group_updated',
 };
-
 class ExtensionEventSource {
   private handlers = new Map<string, EventHandlerRecord[]>();
 
@@ -212,6 +234,12 @@ function saveSettingsDebounced() {
   window.clearTimeout(settingsSaveTimer);
   settingsSaveTimer = window.setTimeout(() => {
     window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(extensionSettings));
+    void fetch('/api/extensions/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...runtime.getRequestHeaders() },
+      body: JSON.stringify({ extension_settings: extensionSettings, merge: true }),
+    }).catch(() => {});
+    void eventSource.emit(eventTypes.SETTINGS_UPDATED);
   }, 250);
 }
 
@@ -220,6 +248,11 @@ export function updateSillyTavernExtensionSettings(patch: Record<string, unknown
   saveSettingsDebounced();
 }
 
+export function getActiveExtensionPrompts() {
+  return Object.entries(extensionPrompts)
+    .filter(([, item]) => item && typeof item.value === 'string' && item.value.trim())
+    .map(([key, item]) => ({ key, ...item }));
+}
 function toast(kind: 'success' | 'info' | 'warning' | 'error', message: string, title?: string) {
   const prefix = title ? `${title}: ` : '';
   runtime.toast(`${prefix}${message}`);
@@ -410,8 +443,172 @@ const lodashMethods = {
 
 const lodashShim = Object.assign((value: unknown) => lodashChain(value), lodashMethods);
 
+function interpolateTemplate(html: string, data: Record<string, unknown> = {}) {
+  if (!data || typeof data !== 'object') return html;
+  return html.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (match, key) => {
+    const val = lodashShim.get(data, key);
+    return val !== undefined && val !== null ? String(val) : match;
+  });
+}
+
+async function renderExtensionTemplateAsyncImpl(extensionName: string, templateId: string, templateData: Record<string, unknown> = {}) {
+  const cleanExt = String(extensionName || '').replace(/^\/+|\/+$/g, '');
+  const cleanId = String(templateId || '').replace(/\.html$/i, '').replace(/^\/+/, '');
+  const cacheKey = `${cleanExt}:${cleanId}`;
+  if (templateCache.has(cacheKey)) {
+    return interpolateTemplate(templateCache.get(cacheKey) || '', templateData);
+  }
+  const candidates = cleanExt
+    ? [
+        `/scripts/extensions/${cleanExt}/${cleanId}.html`,
+        ...(cleanExt.startsWith('third-party/') || cleanExt.startsWith('built-in/')
+          ? []
+          : [`/scripts/extensions/third-party/${cleanExt}/${cleanId}.html`, `/scripts/extensions/built-in/${cleanExt}/${cleanId}.html`]),
+      ]
+    : [`/scripts/extensions/${cleanId}.html`];
+  for (const url of candidates) {
+    try {
+      const response = await fetch(url, { headers: runtime.getRequestHeaders() });
+      if (response.ok) {
+        const html = await response.text();
+        templateCache.set(cacheKey, html);
+        return interpolateTemplate(html, templateData);
+      }
+    } catch {}
+  }
+  return '';
+}
+
+function renderExtensionTemplateImpl(extensionName: string, templateId: string, templateData: Record<string, unknown> = {}) {
+  const cleanExt = String(extensionName || '').replace(/^\/+|\/+$/g, '');
+  const cleanId = String(templateId || '').replace(/\.html$/i, '').replace(/^\/+/, '');
+  const cached = templateCache.get(`${cleanExt}:${cleanId}`);
+  if (cached !== undefined) {
+    return interpolateTemplate(cached, templateData);
+  }
+  void renderExtensionTemplateAsyncImpl(extensionName, templateId, templateData);
+  return '';
+}
+
+async function generateExtensionCompletion(promptOrOpts: unknown, systemPrompt = '', responseLength?: number): Promise<string> {
+  let prompt = '';
+  let sys = systemPrompt;
+  let maxTokens = responseLength;
+  if (typeof promptOrOpts === 'string') {
+    prompt = promptOrOpts;
+  } else if (promptOrOpts && typeof promptOrOpts === 'object') {
+    const opts = promptOrOpts as Record<string, unknown>;
+    prompt = String(opts.quietPrompt ?? opts.quiet_prompt ?? opts.prompt ?? '');
+    sys = String(opts.systemPrompt ?? opts.system_prompt ?? sys ?? '');
+    if (typeof opts.responseLength === 'number') maxTokens = opts.responseLength;
+  }
+  if (!prompt.trim() && !sys.trim()) return '';
+  const response = await fetch('/api/backends/chat-completions/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...runtime.getRequestHeaders() },
+    body: JSON.stringify({ prompt, system_prompt: sys, max_tokens: maxTokens }),
+  });
+  if (!response.ok) return '';
+  const data = await response.json().catch(() => null) as { text?: string; content?: string } | null;
+  return String(data?.text ?? data?.content ?? '');
+}
+
+async function showExtensionPopupModal(content: unknown, type = 1, inputValue = '', options: Record<string, unknown> = {}): Promise<unknown> {
+  const { promise, resolve } = Promise.withResolvers<unknown>();
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.68);display:flex;align-items:center;justify-content:center;padding:16px;';
+  const dialog = document.createElement('div');
+  dialog.style.cssText = 'background:var(--surface,#181924);color:var(--fg,#f4f4f8);border:1px solid var(--border,rgba(255,255,255,0.14));border-radius:14px;max-width:640px;width:100%;max-height:85vh;display:flex;flex-direction:column;gap:12px;padding:18px;box-shadow:0 18px 48px rgba(0,0,0,0.5);';
+  const body = document.createElement('div');
+  body.style.cssText = 'overflow:auto;max-height:65vh;';
+  if (content instanceof HTMLElement) {
+    body.appendChild(content);
+  } else if (content && typeof content === 'object' && 'get' in content && typeof content.get === 'function') {
+    const rawNodes: unknown = content.get();
+    if (Array.isArray(rawNodes)) {
+      rawNodes.forEach((n) => n instanceof Node && body.appendChild(n));
+    }
+  } else {
+    body.innerHTML = String(content ?? '');
+  }
+  dialog.appendChild(body);
+  let inputEl: HTMLInputElement | HTMLTextAreaElement | null = null;
+  if (type === 3) {
+    inputEl = options.rows && Number(options.rows) > 1 ? document.createElement('textarea') : document.createElement('input');
+    inputEl.value = String(inputValue ?? '');
+    inputEl.style.cssText = 'width:100%;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(0,0,0,0.25);color:inherit;';
+    dialog.appendChild(inputEl);
+  }
+  const actions = document.createElement('div');
+  actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;';
+  const close = (result: unknown) => {
+    overlay.remove();
+    resolve(result);
+  };
+  if (type === 2 || type === 3 || options.cancelButton) {
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'ghost-button';
+    cancelBtn.textContent = typeof options.cancelButton === 'string' ? options.cancelButton : 'Cancel';
+    cancelBtn.onclick = () => close(type === 3 ? null : 0);
+    actions.appendChild(cancelBtn);
+  }
+  const okBtn = document.createElement('button');
+  okBtn.type = 'button';
+  okBtn.textContent = typeof options.okButton === 'string' ? options.okButton : 'OK';
+  okBtn.onclick = () => close(type === 3 ? (inputEl?.value ?? '') : 1);
+  actions.appendChild(okBtn);
+  dialog.appendChild(actions);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  inputEl?.focus();
+  return promise;
+}
+
+function substituteExtensionParams(text: string): string {
+  let out = String(text ?? '')
+    .replaceAll('{{user}}', runtime.name1 || 'User')
+    .replaceAll('{{char}}', runtime.name2 || 'Char')
+    .replaceAll('{user}', runtime.name1 || 'User')
+    .replaceAll('{char}', runtime.name2 || 'Char');
+  if (out.includes('{{')) {
+    out = out.replace(/\{\{([^}]+)\}\}/g, (match, rawKey) => {
+      const key = String(rawKey).trim();
+      if (registeredMacros.has(key)) {
+        const macro = registeredMacros.get(key);
+        return typeof macro === 'function' ? String(macro() ?? '') : String(macro ?? '');
+      }
+      return match;
+    });
+  }
+  return out;
+}
+
+export async function executeExtensionSlashCommand(rawInput: string): Promise<{ handled: boolean; output?: string }> {
+  const trimmed = rawInput.trim();
+  if (!trimmed.startsWith('/')) return { handled: false };
+  const spaceIdx = trimmed.indexOf(' ');
+  const cmdName = (spaceIdx >= 0 ? trimmed.slice(1, spaceIdx) : trimmed.slice(1)).toLowerCase();
+  const rest = spaceIdx >= 0 ? trimmed.slice(spaceIdx + 1).trim() : '';
+  const registry = (window as typeof window & { __dtSlashCommands?: Map<string, Record<string, unknown>> }).__dtSlashCommands;
+  if (!registry || !cmdName) return { handled: false };
+  const entry = registry.get(cmdName) || Array.from(registry.values()).find((item) => String(item.name || '').toLowerCase() === cmdName || (Array.isArray(item.aliases) && item.aliases.some((a) => String(a).toLowerCase() === cmdName)));
+  if (!entry || typeof entry.callback !== 'function') return { handled: false };
+  const namedArgs: Record<string, string> = {};
+  let unnamed = rest;
+  const argRegex = /^(\w+)=("[^"]*"|\S+)\s*/;
+  while (true) {
+    const m = unnamed.match(argRegex);
+    if (!m) break;
+    namedArgs[m[1]] = m[2].replace(/^"|"$/g, '');
+    unnamed = unnamed.slice(m[0].length);
+  }
+  const res = await (entry.callback as (args: Record<string, string>, value: string) => unknown)(namedArgs, unnamed);
+  return { handled: true, output: res != null ? String(res) : undefined };
+}
+
 function ensureGlobals() {
-  const win = window as typeof window & { SillyTavern?: unknown; toastr?: unknown; $?: unknown; jQuery?: unknown; t?: unknown; _?: unknown; hljs?: unknown; Popper?: unknown; createPopper?: unknown };
+  const win = window as typeof window & { SillyTavern?: unknown; toastr?: unknown; $?: unknown; jQuery?: unknown; t?: unknown; _?: unknown; hljs?: unknown; Popper?: unknown; createPopper?: unknown; DOMPurify?: unknown };
   win.SillyTavern = {
     getContext: () => {
       const contextChat = runtime.chat;
@@ -424,16 +621,58 @@ function ensureGlobals() {
         selectedPersona: runtime.personas.find((persona) => persona.id === runtime.selectedPersonaId) || runtime.personas[0] || null,
         selectedPersonaId: runtime.selectedPersonaId,
         characterId: runtime.characterId,
+        groupId: null,
+        groups: [],
+        chatId: runtime.chatId || 'default',
+        getCurrentChatId: () => runtime.chatId || 'default',
         name1: runtime.name1,
         name2: runtime.name2,
         extensionSettings: extensionSettings,
+        chatMetadata,
+        chat_metadata: chatMetadata,
+        extensionPrompts,
         eventSource,
         eventTypes,
         event_types: eventTypes,
         getRequestHeaders: () => ({ 'Content-Type': 'application/json', ...runtime.getRequestHeaders() }),
         isExtensionLeader: runtime.extensionLeader,
         saveSettingsDebounced,
+        saveSettings: saveSettingsDebounced,
+        saveMetadataDebounced: saveSettingsDebounced,
+        saveMetadata: async () => saveSettingsDebounced(),
         saveChat: () => saveChatFromExtension(contextChat),
+        reloadCurrentChat: async () => runtime.reloadChat?.(),
+        addOneMessage: async (mes: Record<string, unknown>) => runtime.addMessage?.(mes?.is_user ? 'user' : mes?.is_system ? 'system' : 'assistant', String(mes?.mes ?? ''), String(mes?.name || '')),
+        sendSystemMessage: async (_type: string, text: string) => runtime.addMessage?.('system', String(text ?? ''), 'System'),
+        deleteLastMessage: async () => runtime.deleteLastMessage?.(),
+        stopGeneration: async () => runtime.stopGeneration?.(),
+        generateQuietPrompt: (promptOrOpts: unknown, _quietToLoud?: boolean, _skipWIAN?: boolean, _img?: string, _name?: string, responseLength?: number) => generateExtensionCompletion(promptOrOpts, '', responseLength),
+        generateRaw: (opts: unknown) => generateExtensionCompletion(opts),
+        Generate: (_type: string, opts: Record<string, unknown> = {}) => generateExtensionCompletion(opts.quiet_prompt || opts),
+        setExtensionPrompt: (key: string, value: string, position = 1, depth = 4, scan = false, role = 0) => {
+          extensionPrompts[String(key)] = { value: String(value ?? ''), position: Number(position), depth: Number(depth), scan: Boolean(scan), role: Number(role) };
+        },
+        renderExtensionTemplateAsync: renderExtensionTemplateAsyncImpl,
+        renderExtensionTemplate: renderExtensionTemplateImpl,
+        writeExtensionField: async (_chid: unknown, key: string, value: unknown) => {
+          extensionSettings[String(key)] = value;
+          saveSettingsDebounced();
+        },
+        callGenericPopup: showExtensionPopupModal,
+        callPopup: showExtensionPopupModal,
+        POPUP_TYPE: { TEXT: 1, CONFIRM: 2, INPUT: 3, DISPLAY: 4 },
+        POPUP_RESULT: { AFFIRMATIVE: 1, NEGATIVE: 0, CANCELLED: null },
+        substituteParams: substituteExtensionParams,
+        substituteParamsExtended: substituteExtensionParams,
+        registerMacro: (name: string, value: string | (() => unknown)) => { registeredMacros.set(String(name), value); },
+        unregisterMacro: (name: string) => { registeredMacros.delete(String(name)); },
+        registerSlashCommand: (name: string, callback: unknown, aliases: string[] = [], helpString = '') => {
+          const reg = ((window as typeof window & { __dtSlashCommands?: Map<string, unknown> }).__dtSlashCommands ??= new Map());
+          reg.set(String(name), { name, callback, aliases, helpString });
+        },
+        executeSlashCommands: async (text: string) => (await executeExtensionSlashCommand(text)).output ?? '',
+        executeSlashCommandsWithOptions: async (text: string) => ({ pipe: (await executeExtensionSlashCommand(text)).output ?? '' }),
+        getTokenCountAsync: async (text: string) => Math.ceil(String(text ?? '').length / 4),
         messageFormatting: formatExtensionMessageHtml,
         getCharacterAvatar: (characterId: number) => runtime.characters[characterId]?.image_url || runtime.characters[characterId]?.avatar || '',
         scrollOnMediaLoad: () => window.requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })),
@@ -447,7 +686,33 @@ function ensureGlobals() {
     error: (message: string, title?: string) => toast('error', message, title),
     clear: () => {},
   };
-  win.$ = win.jQuery = jqueryShim;
+  win.$ = win.jQuery = Object.assign(jqueryShim, {
+    extend: (_deepOrTarget: unknown, ...rest: unknown[]) => Object.assign(typeof _deepOrTarget === 'boolean' ? (rest.shift() as object || {}) : (_deepOrTarget as object || {}), ...rest),
+    ajax: async (opts: Record<string, unknown>) => {
+      const res = await fetch(String(opts.url || ''), {
+        method: String(opts.type || opts.method || 'GET'),
+        headers: { ...(opts.contentType ? { 'Content-Type': String(opts.contentType) } : {}), ...runtime.getRequestHeaders(), ...(opts.headers as Record<string, string> || {}) },
+        body: opts.data ? (typeof opts.data === 'string' ? opts.data : JSON.stringify(opts.data)) : undefined,
+      });
+      const data = await res.json().catch(() => res.text());
+      if (res.ok && typeof opts.success === 'function') opts.success(data);
+      if (!res.ok && typeof opts.error === 'function') opts.error(res);
+      return data;
+    },
+    get: async (url: string, cb?: (data: unknown) => void) => {
+      const res = await fetch(url, { headers: runtime.getRequestHeaders() });
+      const data = await res.text();
+      cb?.(data);
+      return data;
+    },
+    getJSON: async (url: string, cb?: (data: unknown) => void) => {
+      const res = await fetch(url, { headers: runtime.getRequestHeaders() });
+      const data = await res.json();
+      cb?.(data);
+      return data;
+    },
+  });
+  win.DOMPurify = win.DOMPurify || { sanitize: (html: string) => html };
   win.t = (strings: TemplateStringsArray | string, ...values: unknown[]) => Array.isArray(strings) && 'raw' in strings ? String.raw(strings, ...values) : String(strings);
   win._ = lodashShim;
   win.hljs = win.hljs || { highlightElement: () => {} };
@@ -456,7 +721,6 @@ function ensureGlobals() {
   win.Popper = win.Popper || { createPopper };
   installFileInputLabelCompatibility();
 }
-
 function installFileInputLabelCompatibility() {
   if (fileInputLabelCompatibilityInstalled) {
     return;
@@ -571,22 +835,38 @@ function jqueryCollection(elements: unknown[]) {
     },
     append: (child: unknown) => {
       const children = childElements(child);
-      elements.forEach((element) => element instanceof Element && children.forEach((childElement) => element.appendChild(childElement.cloneNode(true))));
+      elements.forEach((element, idx) => {
+        if (element instanceof Element) {
+          children.forEach((childElement) => {
+            const node = idx === 0 ? childElement : (childElement.cloneNode(true) as Element);
+            assignSettingsOwner(node, element);
+            element.appendChild(node);
+          });
+        }
+      });
       return api;
     },
     prepend: (child: unknown) => {
       const children = childElements(child);
-      elements.forEach((element) => element instanceof Element && children.slice().reverse().forEach((childElement) => element.prepend(childElement.cloneNode(true))));
+      elements.forEach((element, idx) => {
+        if (element instanceof Element) {
+          children.slice().reverse().forEach((childElement) => {
+            const node = idx === 0 ? childElement : (childElement.cloneNode(true) as Element);
+            assignSettingsOwner(node, element);
+            element.prepend(node);
+          });
+        }
+      });
       return api;
     },
     before: (child: unknown) => {
       const children = childElements(child);
-      elements.forEach((element) => element instanceof Element && children.forEach((childElement) => element.before(childElement.cloneNode(true))));
+      elements.forEach((element, idx) => element instanceof Element && children.forEach((childElement) => element.before(idx === 0 ? childElement : childElement.cloneNode(true))));
       return api;
     },
     after: (child: unknown) => {
       const children = childElements(child);
-      elements.forEach((element) => element instanceof Element && children.slice().reverse().forEach((childElement) => element.after(childElement.cloneNode(true))));
+      elements.forEach((element, idx) => element instanceof Element && children.slice().reverse().forEach((childElement) => element.after(idx === 0 ? childElement : childElement.cloneNode(true))));
       return api;
     },
     on: (event: string, selectorOrHandler: string | EventListener, maybeHandler?: EventListener) => {
@@ -731,7 +1011,67 @@ function jqueryCollection(elements: unknown[]) {
       elements.forEach((element) => element instanceof Element && element.classList.remove(...className.split(/\s+/).filter(Boolean)));
       return api;
     },
+    toggleClass: (className: string, force?: boolean) => {
+      elements.forEach((element) => {
+        if (element instanceof Element) {
+          className.split(/\s+/).filter(Boolean).forEach((cls) => element.classList.toggle(cls, force));
+        }
+      });
+      return api;
+    },
     hasClass: (className: string) => elements[0] instanceof Element ? elements[0].classList.contains(className) : false,
+    fadeIn: (_duration?: number, callback?: () => void) => {
+      elements.forEach((element) => { if (element instanceof HTMLElement) element.style.display = ''; });
+      callback?.();
+      return api;
+    },
+    fadeOut: (_duration?: number, callback?: () => void) => {
+      elements.forEach((element) => { if (element instanceof HTMLElement) element.style.display = 'none'; });
+      callback?.();
+      return api;
+    },
+    slideUp: (_duration?: number, callback?: () => void) => {
+      elements.forEach((element) => { if (element instanceof HTMLElement) element.style.display = 'none'; });
+      callback?.();
+      return api;
+    },
+    slideDown: (_duration?: number, callback?: () => void) => {
+      elements.forEach((element) => { if (element instanceof HTMLElement) element.style.display = ''; });
+      callback?.();
+      return api;
+    },
+    slideToggle: (_duration?: number, callback?: () => void) => {
+      elements.forEach((element) => { if (element instanceof HTMLElement) element.style.display = element.style.display === 'none' ? '' : 'none'; });
+      callback?.();
+      return api;
+    },
+    focus: () => {
+      if (elements[0] instanceof HTMLElement) elements[0].focus();
+      return api;
+    },
+    blur: () => {
+      if (elements[0] instanceof HTMLElement) elements[0].blur();
+      return api;
+    },
+    next: (selector?: string) => {
+      const nextEls = elementOnly().map((el) => el.nextElementSibling).filter((el): el is Element => Boolean(el));
+      return jqueryCollection(selector ? nextEls.filter((el) => el.matches(selector)) : nextEls);
+    },
+    prev: (selector?: string) => {
+      const prevEls = elementOnly().map((el) => el.previousElementSibling).filter((el): el is Element => Boolean(el));
+      return jqueryCollection(selector ? prevEls.filter((el) => el.matches(selector)) : prevEls);
+    },
+    not: (selector: string) => jqueryCollection(elementOnly().filter((el) => !el.matches(selector))),
+    index: () => elements[0] instanceof Element && elements[0].parentElement ? Array.from(elements[0].parentElement.children).indexOf(elements[0]) : -1,
+    width: () => elements[0] instanceof HTMLElement ? elements[0].clientWidth : 0,
+    height: () => elements[0] instanceof HTMLElement ? elements[0].clientHeight : 0,
+    outerWidth: () => elements[0] instanceof HTMLElement ? elements[0].offsetWidth : 0,
+    outerHeight: () => elements[0] instanceof HTMLElement ? elements[0].offsetHeight : 0,
+    scrollTop: (val?: number) => {
+      if (val === undefined) return elements[0] instanceof Element ? elements[0].scrollTop : 0;
+      elements.forEach((el) => { if (el instanceof Element) el.scrollTop = val; });
+      return api;
+    },
     serializeArray: () => elementOnly().flatMap((element) => Array.from(element.querySelectorAll('input, select, textarea')))
       .filter((field): field is HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement => 'name' in field && 'value' in field && Boolean(field.name))
       .map((field) => ({ name: field.name, value: field.value })),
@@ -820,7 +1160,16 @@ function sanitizeNode(node: ChildNode, options: ExtensionMessageFormatOptions): 
   }
 
   const tag = node.tagName.toLowerCase();
-  const allowedTags = new Set(['div', 'span', 'p', 'br', 'img', 'video', 'source', 'strong', 'b', 'em', 'i', 'small', 'label', 'input', 'details', 'summary', 'ul', 'ol', 'li']);
+  const allowedTags = new Set([
+    'div', 'span', 'p', 'br', 'hr', 'img', 'video', 'audio', 'source',
+    'strong', 'b', 'em', 'i', 'u', 's', 'del', 'ins', 'sub', 'sup', 'mark', 'small',
+    'code', 'pre', 'blockquote', 'a', 'button', 'label', 'input', 'select', 'option', 'textarea',
+    'details', 'summary', 'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+    'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'figure', 'figcaption', 'section', 'article', 'header', 'footer', 'nav', 'aside',
+    'svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'g', 'defs', 'lineargradient', 'stop',
+  ]);
   if (!allowedTags.has(tag)) {
     return escapeHtml(node.outerHTML || node.textContent || '');
   }
@@ -835,7 +1184,7 @@ function sanitizeNode(node: ChildNode, options: ExtensionMessageFormatOptions): 
   if ((tag === 'img' || tag === 'video') && isImagePendingMarker(node)) {
     return `<span class="iig-pending-media-shell">${renderSanitizedElement(tag, attrs, node, options)}</span>`;
   }
-  if (tag === 'br' || tag === 'img' || tag === 'input' || tag === 'source') {
+  if (tag === 'br' || tag === 'hr' || tag === 'img' || tag === 'input' || tag === 'source') {
     return `<${tag}${attrs}>`;
   }
   return renderSanitizedElement(tag, attrs, node, options);
@@ -866,7 +1215,7 @@ function renderImagePendingPlaceholder(node: Element, options: ExtensionMessageF
 }
 
 function renderSanitizedElement(tag: string, attrs: string, node: Element, options: ExtensionMessageFormatOptions) {
-  if (tag === 'br' || tag === 'img' || tag === 'input' || tag === 'source') {
+  if (tag === 'br' || tag === 'hr' || tag === 'img' || tag === 'input' || tag === 'source') {
     return `<${tag}${attrs}>`;
   }
   return `<${tag}${attrs}>${Array.from(node.childNodes).map((child) => sanitizeNode(child, options)).join('')}</${tag}>`;
@@ -880,17 +1229,20 @@ function sanitizeAttribute(tag: string, name: string, value: string) {
   if (attr.startsWith('data-') || attr.startsWith('aria-')) {
     return ` ${attr}="${escapeHtml(value)}"`;
   }
-  if (['class', 'id', 'style', 'title', 'alt', 'name', 'type', 'value', 'checked', 'for'].includes(attr)) {
-    return ` ${attr}="${escapeHtml(value)}"`;
+  if (['class', 'id', 'style', 'title', 'alt', 'name', 'type', 'value', 'checked', 'for', 'placeholder', 'disabled', 'readonly', 'selected', 'rows', 'cols', 'min', 'max', 'step', 'colspan', 'rowspan', 'open', 'role', 'tabindex', 'viewbox', 'd', 'fill', 'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin', 'width', 'height', 'cx', 'cy', 'r', 'rx', 'ry', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'points', 'xmlns', 'offset', 'stop-color', 'stop-opacity'].includes(attr)) {
+    return ` ${name}="${escapeHtml(value)}"`;
+  }
+  if (attr === 'href') {
+    return /^(https?:|mailto:|\/|#)/i.test(value.trim()) ? ` href="${escapeHtml(value.trim())}" target="_blank" rel="noopener noreferrer"` : '';
   }
   if (['controls', 'autoplay', 'loop', 'muted', 'playsinline'].includes(attr)) {
-    return tag === 'video' ? ` ${attr}="${escapeHtml(value)}"` : '';
+    return tag === 'video' || tag === 'audio' ? ` ${attr}="${escapeHtml(value)}"` : '';
   }
   if (['src', 'poster'].includes(attr)) {
     if (/^\[(?:IMG|VID):/i.test(value)) {
       return ` data-iig-pending-${attr}="${escapeHtml(value)}"`;
     }
-    return /^(https?:|data:image\/|data:video\/|\/|#)/i.test(value) ? ` ${attr}="${escapeHtml(value)}"` : '';
+    return /^(https?:|data:image\/|data:video\/|data:audio\/|\/|#)/i.test(value) ? ` ${attr}="${escapeHtml(value)}"` : '';
   }
   return '';
 }
@@ -976,13 +1328,23 @@ function loadScript(name: string, manifest: ExtensionManifest) {
   });
 }
 
-export async function initSillyTavernExtensions() {
-  if (extensionsInitialized) {
-    return;
+export async function syncServerExtensionSettings() {
+  const data = await loadJson<{ extension_settings?: Record<string, unknown> }>('/api/extensions/settings');
+  if (data?.extension_settings && typeof data.extension_settings === 'object') {
+    Object.entries(data.extension_settings).forEach(([key, value]) => {
+      if (value && typeof value === 'object' && !Array.isArray(value) && extensionSettings[key] && typeof extensionSettings[key] === 'object') {
+        extensionSettings[key] = { ...(extensionSettings[key] as Record<string, unknown>), ...(value as Record<string, unknown>) };
+      } else if (extensionSettings[key] === undefined) {
+        extensionSettings[key] = value;
+      }
+    });
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(extensionSettings));
   }
-  extensionsInitialized = true;
-  ensureGlobals();
+}
 
+export async function syncSillyTavernExtensions() {
+  ensureGlobals();
+  await syncServerExtensionSettings();
   const discovered = await loadJson<Array<{ name: string; type: string }>>('/api/extensions/discover') ?? [];
   const manifests = await Promise.all(discovered.map(async (extension) => ({
     name: extension.name,
@@ -993,11 +1355,31 @@ export async function initSillyTavernExtensions() {
     .filter((item): item is { name: string; manifest: ExtensionManifest } => Boolean(item.manifest))
     .sort((a, b) => Number(a.manifest.loading_order ?? 100) - Number(b.manifest.loading_order ?? 100));
 
+  let newlyLoaded = false;
   for (const extension of enabled) {
+    const wasLoaded = loadedExtensionScripts.has(extension.name);
     loadStyle(extension.name, extension.manifest);
-    await loadScript(extension.name, extension.manifest);
+    try {
+      await loadScript(extension.name, extension.manifest);
+      if (!wasLoaded && loadedExtensionScripts.has(extension.name)) {
+        newlyLoaded = true;
+      }
+    } catch (err) {
+      console.warn('[extension:load-error]', extension.name, err);
+    }
   }
+  if (newlyLoaded) {
+    await eventSource.emit(eventTypes.APP_READY);
+    await eventSource.emit(eventTypes.CHAT_CHANGED);
+  }
+}
 
+export async function initSillyTavernExtensions() {
+  if (extensionsInitialized) {
+    return;
+  }
+  extensionsInitialized = true;
+  await syncSillyTavernExtensions();
   await eventSource.emit(eventTypes.APP_READY);
   await eventSource.emit(eventTypes.CHAT_CHANGED);
 }
@@ -1007,9 +1389,15 @@ export async function emitSillyTavernChatChanged() {
 }
 
 export async function emitSillyTavernMessageRendered(index: number, role: RuntimeMessage['role']) {
+  await eventSource.emit(role === 'user' ? eventTypes.MESSAGE_SENT : eventTypes.MESSAGE_RECEIVED, index);
   await eventSource.emit(role === 'user' ? eventTypes.USER_MESSAGE_RENDERED : eventTypes.CHARACTER_MESSAGE_RENDERED, index);
 }
 
 export async function emitSillyTavernMessageSwiped(index: number) {
   await eventSource.emit(eventTypes.MESSAGE_SWIPED, index);
+}
+
+export async function emitSillyTavernGenerationEvent(stage: 'started' | 'ended' | 'stopped') {
+  const evt = stage === 'started' ? eventTypes.GENERATION_STARTED : stage === 'stopped' ? eventTypes.GENERATION_STOPPED : eventTypes.GENERATION_ENDED;
+  await eventSource.emit(evt);
 }

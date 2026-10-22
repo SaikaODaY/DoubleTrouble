@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import re
 from typing import Any
-
 
 class RegexService:
     PLACEMENT_MD_DISPLAY = 0
@@ -17,6 +17,7 @@ class RegexService:
     SUBSTITUTE_ESCAPED = 2
 
     @staticmethod
+    @lru_cache(maxsize=1024)
     def regex_from_string(pattern: str) -> re.Pattern[str]:
         match = re.match(r"^/(.*)/([gimuy]*)$", pattern)
         if match:
@@ -70,14 +71,13 @@ class RegexService:
         if substitute == RegexService.SUBSTITUTE_RAW:
             return RegexService._substitute_params(find_regex, user_name, char_name)
         if substitute == RegexService.SUBSTITUTE_ESCAPED:
-            return RegexService._substitute_params(
-                find_regex, user_name, char_name
-            ).replace("{{user}}", RegexService._sanitize_regex_macro(user_name)).replace(
-                "{{char}}", RegexService._sanitize_regex_macro(char_name)
-            ).replace(
-                "{user}", RegexService._sanitize_regex_macro(user_name)
-            ).replace(
-                "{char}", RegexService._sanitize_regex_macro(char_name)
+            escaped_user = RegexService._sanitize_regex_macro(user_name)
+            escaped_char = RegexService._sanitize_regex_macro(char_name)
+            return (
+                find_regex.replace("{{user}}", escaped_user)
+                .replace("{{char}}", escaped_char)
+                .replace("{user}", escaped_user)
+                .replace("{char}", escaped_char)
             )
         return find_regex
 

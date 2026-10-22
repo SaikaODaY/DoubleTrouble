@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
+import random
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
-
 import yaml
 
 from backend.app.config import GenerationConfig
@@ -276,10 +278,13 @@ class GenerationService:
     def _default_prompt_assembly(self, character_name: str, persona_name: str, persona_description: str, character_data: dict[str, Any], history_messages: list[ChatMessage], world_info: dict[str, Any]) -> list[ChatMessage]:
         result: list[ChatMessage] = []
         parts: list[str] = []
+        char_sys = self._substitute_prompt(str(character_data.get("system_prompt") or "").strip(), character_name, persona_name)
         description = self._substitute_prompt(str(character_data.get("description") or "").strip(), character_name, persona_name)
         personality = self._substitute_prompt(str(character_data.get("personality") or "").strip(), character_name, persona_name)
         scenario = self._substitute_prompt(str(character_data.get("scenario") or "").strip(), character_name, persona_name)
         substituted_persona = self._substitute_prompt(persona_description, character_name, persona_name)
+        if char_sys:
+            parts.append(char_sys)
         if description:
             parts.append(description)
         if personality:
@@ -299,6 +304,9 @@ class GenerationService:
         world_after = self._substitute_prompt(str(world_info.get("worldInfoAfter") or "").strip(), character_name, persona_name)
         if world_after:
             result.append(ChatMessage(role="system", content=world_after))
+        post_hist = self._substitute_prompt(str(character_data.get("post_history_instructions") or "").strip(), character_name, persona_name)
+        if post_hist:
+            result.append(ChatMessage(role="system", content=post_hist))
         return result
 
     def _history_messages(self, history: list[BotChatMessage], preset: dict[str, Any] | None = None, force_user_names: bool = False, character_name: str = "", persona_name: str = "") -> list[ChatMessage]:
@@ -327,9 +335,25 @@ class GenerationService:
         absolute_prompts = [prompt for prompt in prompts if self._int_value(prompt.get("injection_position"), 0) == 1 and self._prompt_content(prompt, character_name, persona_name, persona_description, character_data, preset, world_info)]
         for prompt in world_info.get("depthPrompts") or []:
             if isinstance(prompt, dict) and str(prompt.get("content") or "").strip():
-                absolute_prompts.append({"role": prompt.get("role") or "system", "content": prompt.get("content"), "injection_position": 1, "injection_depth": prompt.get("injection_depth") or 4, "injection_order": prompt.get("injection_order") or 100})
+                absolute_prompts.append({"role": prompt.get("role") or "system", "content": prompt.get("content"), "injection_position": 1, "injection_depth": prompt.get("injection_depth") if prompt.get("injection_depth") is not None else 4, "injection_order": prompt.get("injection_order") or 100})
+        char_ext = character_data.get("extensions") if isinstance(character_data.get("extensions"), dict) else {}
+        depth_prompt = char_ext.get("depth_prompt") if isinstance(char_ext, dict) else None
+        if isinstance(depth_prompt, dict) and str(depth_prompt.get("prompt") or "").strip():
+            dp_role = str(depth_prompt.get("role") or "system").lower()
+            if dp_role not in {"system", "user", "assistant"}:
+                dp_role = "system"
+            absolute_prompts.append({"role": dp_role, "content": str(depth_prompt.get("prompt")).strip(), "injection_position": 1, "injection_depth": self._int_value(depth_prompt.get("depth"), 4), "injection_order": 100})
+        for ext_prompt in world_info.get("extensionPrompts") or []:
+            if isinstance(ext_prompt, dict) and str(ext_prompt.get("value") or ext_prompt.get("content") or "").strip():
+                ep_text = str(ext_prompt.get("value") or ext_prompt.get("content")).strip()
+                ep_role_raw = ext_prompt.get("role", 0)
+                ep_role = "user" if ep_role_raw in (1, "1", "user") else "assistant" if ep_role_raw in (2, "2", "assistant") else "system"
+                ep_pos = self._int_value(ext_prompt.get("position"), 0)
+                if ep_pos == 1:  # BEFORE_PROMPT
+                    messages.append(ChatMessage(role=ep_role, content=self._substitute_prompt(ep_text, character_name, persona_name)))
+                else:
+                    absolute_prompts.append({"role": ep_role, "content": ep_text, "injection_position": 1, "injection_depth": self._int_value(ext_prompt.get("depth"), 4), "injection_order": 100})
         inserted_history = False
-
         for prompt in prompts:
             identifier = str(prompt.get("identifier") or "")
             if self._int_value(prompt.get("injection_position"), 0) == 1:
@@ -599,10 +623,59 @@ class GenerationService:
         return [entry for entry in first.get("order", []) if isinstance(entry, dict)]
 
     def _substitute_prompt(self, content: str, character_name: str, persona_name: str) -> str:
-        return (
+        if not content:
+            return ""
+        text = (
             content
             .replace("{{char}}", character_name)
+            .replace("{{Char}}", character_name)
+            .replace("{{CHAR}}", character_name)
             .replace("{{user}}", persona_name)
+            .replace("{{User}}", persona_name)
+            .replace("{{USER}}", persona_name)
             .replace("{char}", character_name)
             .replace("{user}", persona_name)
+            .replace("<BOT>", character_name)
+            .replace("<CHAR>", character_name)
+            .replace("<USER>", persona_name)
         )
+        if "{{" not in text:
+            return text
+        text = re.sub(r"\{\{//[\s\S]*?\}\}", "", text)
+        text = re.sub(r"\n?\{\{trim\}\}\n?", "", text, flags=re.IGNORECASE)
+        text = (
+            text.replace("{{newline}}", "\n")
+            .replace("{{noop}}", "")
+        )
+        if "{{" not in text:
+            return text
+        now = datetime.now()
+        text = (
+            text.replace("{{time}}", now.strftime("%H:%M"))
+            .replace("{{date}}", now.strftime("%Y-%m-%d"))
+            .replace("{{weekday}}", now.strftime("%A"))
+            .replace("{{isotime}}", now.strftime("%H:%M:%S"))
+            .replace("{{isodate}}", now.strftime("%Y-%m-%d"))
+        )
+
+        def _random_replacer(m: re.Match[str]) -> str:
+            body = m.group(1)
+            items = [item.strip() for item in (body.split("::") if "::" in body else body.split(",")) if item.strip()]
+            return random.choice(items) if items else ""
+
+        def _roll_replacer(m: re.Match[str]) -> str:
+            spec = m.group(1).strip().lower()
+            rm = re.match(r"^(\d*)d(\d+)([+-]\d+)?$", spec)
+            if not rm:
+                try:
+                    return str(random.randint(1, max(1, int(spec))))
+                except ValueError:
+                    return m.group(0)
+            count = min(100, max(1, int(rm.group(1) or "1")))
+            sides = max(1, int(rm.group(2)))
+            mod = int(rm.group(3) or "0")
+            return str(sum(random.randint(1, sides) for _ in range(count)) + mod)
+
+        text = re.sub(r"\{\{(?:random|pick):(?::)?([\s\S]*?)\}\}", _random_replacer, text, flags=re.IGNORECASE)
+        text = re.sub(r"\{\{roll:([^}]+)\}\}", _roll_replacer, text, flags=re.IGNORECASE)
+        return text

@@ -592,3 +592,11 @@ export function importRegexPreset(json: string): RegexPreset | null {
     return null;
   }
 }
+
+if (typeof window !== 'undefined') {
+  (window as typeof window & { DoubleTroubleRegex?: unknown }).DoubleTroubleRegex = {
+    regex_placement,
+    getRegexedString,
+    runRegexScript,
+  };
+}

@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { emitSillyTavernChatChanged, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, formatExtensionMessageHtml, initSillyTavernExtensions, updateSillyTavernExtensionSettings, updateSillyTavernRuntime, type ExtensionMessageFormatOptions } from './sillyTavernExtensions';
-import { getRegexedString, getRegexScripts, regex_placement, setRegexContext, setRegexNames } from './regexEngine';
+import { emitSillyTavernChatChanged, emitSillyTavernGenerationEvent, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, executeExtensionSlashCommand, formatExtensionMessageHtml, getActiveExtensionPrompts, initSillyTavernExtensions, syncServerExtensionSettings, syncSillyTavernExtensions, updateSillyTavernExtensionSettings, updateSillyTavernRuntime, type ExtensionMessageFormatOptions } from './sillyTavernExtensions';
+import { allowScopedScripts, getRegexedString, getRegexScripts, regex_placement, saveScriptsByType, SCRIPT_TYPES, setRegexContext, setRegexNames, type RegexScript } from './regexEngine';
 import { RegexSettingsPortal } from './RegexSettings';
 import { MagicTranslationSettingsPortal } from './MagicTranslationSettings';
 import { loadMagicTranslationSettings, translateText } from './magicTranslationEngine';
@@ -1017,6 +1017,7 @@ export default function App() {
       activePersonas: activeReferencePersonas.map((persona) => ({ ...persona, avatar_url: imageSrc(persona.avatar_url) })),
       selectedPersonaId,
       characterId: activeCard ? 0 : undefined,
+      chatId: activeChat?.id || 'default',
       name1: userName,
       name2: charName,
       getRequestHeaders: actorHeaders,
@@ -2101,6 +2102,11 @@ export default function App() {
       return;
     }
     if (section === 'extensions') {
+      void syncSillyTavernExtensions();
+      return;
+    }
+    if (section === 'extension_settings') {
+      void syncServerExtensionSettings();
       return;
     }
     await Promise.all([refreshLibrary(), loadGenerationSettings(), loadConnectionPresets(), loadPresetTypes(), loadLorebooks()]);
@@ -2357,7 +2363,7 @@ export default function App() {
     setConnectionMessage(t('connection.checking'));
     const response = await fetch('/api/generation/models', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authJsonHeaders(),
       body: JSON.stringify(generationSettings),
     });
     const data = await response.json().catch(() => null) as { ok?: boolean; error?: string; models?: unknown } | null;
@@ -2400,10 +2406,15 @@ export default function App() {
       setLibraryMessage(error?.detail || t('cards.error.import'));
       return;
     }
+    const importedData = await response.json().catch(() => null) as { card?: CharacterCard; regex_scripts?: RegexScript[] } | null;
+    if (importedData?.card?.id && Array.isArray(importedData.regex_scripts) && importedData.regex_scripts.length) {
+      setRegexContext(importedData.card.id, activeConnectionPresetName, generationSettings.chat_completion_source || generationSettings.provider || 'openai');
+      saveScriptsByType(importedData.regex_scripts, SCRIPT_TYPES.SCOPED);
+      allowScopedScripts();
+    }
     setLibraryMessage(t('cards.imported'));
     await refreshLibrary();
   };
-
   const createCard = async () => {
     const name = cardDraft.name.trim();
     if (!name) {
@@ -2881,6 +2892,14 @@ export default function App() {
       }
       return;
     }
+    const extCmdResult = await executeExtensionSlashCommand(regexedCommand);
+    if (extCmdResult.handled) {
+      setChatInput('');
+      if (extCmdResult.output) {
+        setLibraryMessage(extCmdResult.output);
+      }
+      return;
+    }
     setLibraryMessage(t('commands.unknown'));
   };
 
@@ -3034,6 +3053,7 @@ export default function App() {
     setGenerationStatus(`${activeCard.name} ${t('composer.typing')}`);
     setLibraryMessage(replaceMessageId ? t('message.reroll') : t('message.botAnswering'));
     try {
+      void emitSillyTavernGenerationEvent('started');
       const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(chat.id)}/bot/reply`, {
         method: 'POST',
         headers: authJsonHeaders(),
@@ -3046,14 +3066,17 @@ export default function App() {
           persona_description: selectedPersona?.description || '',
           participants: generationParticipants(),
           regex_scripts: getRegexScripts({ allowedOnly: true }),
+          extension_prompts: getActiveExtensionPrompts(),
         }),
       });
       if (!response.ok) {
         const error = await response.json().catch(() => null) as { detail?: string } | null;
         setLibraryMessage(response.status === 499 ? t('message.generationCancelled') : error?.detail || t('message.error.botReply'));
+        void emitSillyTavernGenerationEvent(response.status === 499 ? 'stopped' : 'ended');
         return;
       }
       const data = await response.json() as { chat: BotChat };
+      void emitSillyTavernGenerationEvent('ended');
       setActiveChat(data.chat);
       setLibraryMessage(replaceMessageId ? t('message.rerollAdded') : t('message.botReplyAdded'));
       const mtSettings = loadMagicTranslationSettings();
@@ -3295,9 +3318,9 @@ export default function App() {
               const visibleMessageContent = generationReplaceMessageId === message.id && generationStreamText ? generationStreamText : displayContent;
               return (
                <article
+                 key={message.id}
                  className={messageClass}
                  {...{ mesid: String(messageIndex) }}
-                 key={message.id}
                 tabIndex={canSwipe ? 0 : undefined}
                 onKeyDown={(event) => {
                   if (!canSwipe || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) {
@@ -4490,9 +4513,11 @@ function ExtensionsManager() {
   const [imageEndpointPresets, setImageEndpointPresets] = useState(loadImageEndpointPresets);
   const [selectedImageEndpointName, setSelectedImageEndpointName] = useState('');
   const [imageEndpointName, setImageEndpointName] = useState('');
+  const [installUrl, setInstallUrl] = useState('');
+  const [installBranch, setInstallBranch] = useState('');
+  const [installOverwrite, setInstallOverwrite] = useState(true);
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
-
   const headers = (json = false) => {
     const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
     const accessToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
@@ -4562,6 +4587,9 @@ function ExtensionsManager() {
         return false;
       }
       setExtensions((current) => current.map((item) => item.name === extension.name ? { ...item, enabled } : item));
+      if (enabled) {
+        void syncSillyTavernExtensions();
+      }
       setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.oldMessagesNotRerendered')}`);
       return true;
     } finally {
@@ -4647,6 +4675,85 @@ function ExtensionsManager() {
     setMessage(t('extensions.endpointSaved'));
   };
 
+  const installFromGit = async () => {
+    const source = installUrl.trim();
+    if (!source) {
+      return;
+    }
+    setLoading(true);
+    try {
+      const response = await fetch('/api/extensions/install', {
+        method: 'POST',
+        headers: headers(true),
+        body: JSON.stringify({
+          source,
+          branch: installBranch.trim(),
+          enabled: true,
+          overwrite: installOverwrite,
+        }),
+      });
+      const data = await response.json().catch(() => null) as { extension?: ExtensionSummary; detail?: string } | null;
+      if (!response.ok || !data?.extension) {
+        setMessage(data?.detail || t('extensions.error.install'));
+        return;
+      }
+      setInstallUrl('');
+      setInstallBranch('');
+      await loadExtensions();
+      await syncSillyTavernExtensions();
+      setMessage(`${t('extensions.installedOk')} (${data.extension.manifest?.display_name || data.extension.name})`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const uploadExtensionZip = async (file: File | null) => {
+    if (!file) {
+      return;
+    }
+    setLoading(true);
+    try {
+      const body = new FormData();
+      body.append('file', file);
+      body.append('overwrite', String(installOverwrite));
+      const response = await fetch('/api/extensions/upload', {
+        method: 'POST',
+        headers: headers(false),
+        body,
+      });
+      const data = await response.json().catch(() => null) as { extension?: ExtensionSummary; detail?: string } | null;
+      if (!response.ok || !data?.extension) {
+        setMessage(data?.detail || t('extensions.error.install'));
+        return;
+      }
+      await loadExtensions();
+      await syncSillyTavernExtensions();
+      setMessage(`${t('extensions.installedOk')} (${data.extension.manifest?.display_name || data.extension.name})`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateExtension = async (extension: ExtensionSummary) => {
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/extensions/${encodeURIComponent(extension.name)}/update`, {
+        method: 'POST',
+        headers: headers(false),
+      });
+      const data = await response.json().catch(() => null) as { extension?: ExtensionSummary; detail?: string } | null;
+      if (!response.ok || !data?.extension) {
+        setMessage(data?.detail || t('extensions.error.update'));
+        return;
+      }
+      await loadExtensions();
+      await syncSillyTavernExtensions();
+      setMessage(`${t('extensions.updatedOk')} (${data.extension.manifest?.display_name || data.extension.name})`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const deleteExtension = async (extension: ExtensionSummary) => {
     setLoading(true);
     try {
@@ -4674,8 +4781,42 @@ function ExtensionsManager() {
       <div className="extension-install-card">
         <span className="extension-warning">{t('extensions.unstable')}</span>
         <p className="helper-text">{t('extensions.installDisabledHelp')}</p>
-        <div className="preset-actions">
-          <button type="button" disabled>{t('extensions.installDisabled')}</button>
+        <div className="key-manager-edit" style={{ display: 'grid', gap: '8px', marginTop: '8px' }}>
+          <input
+            value={installUrl}
+            placeholder={t('extensions.installPlaceholder')}
+            onChange={(event) => setInstallUrl(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Enter' && installUrl.trim()) void installFromGit(); }}
+          />
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+            <input
+              style={{ flex: '1 1 200px' }}
+              value={installBranch}
+              placeholder={t('extensions.branchPlaceholder')}
+              onChange={(event) => setInstallBranch(event.target.value)}
+            />
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '0.88rem' }}>
+              <input type="checkbox" checked={installOverwrite} onChange={(event) => setInstallOverwrite(event.target.checked)} />
+              <span>{t('extensions.overwrite')}</span>
+            </label>
+          </div>
+        </div>
+        <div className="preset-actions" style={{ marginTop: '10px' }}>
+          <button type="button" disabled={loading || !installUrl.trim()} onClick={() => void installFromGit()}>{t('extensions.installDisabled')}</button>
+          <label className="ghost-button" style={{ cursor: loading ? 'not-allowed' : 'pointer', display: 'inline-flex', alignItems: 'center' }}>
+            <span>{t('extensions.uploadZip')}</span>
+            <input
+              type="file"
+              accept=".zip,application/zip"
+              style={{ display: 'none' }}
+              disabled={loading}
+              onChange={(event) => {
+                const file = event.target.files?.[0] || null;
+                event.target.value = '';
+                void uploadExtensionZip(file);
+              }}
+            />
+          </label>
           <button className="ghost-button" type="button" disabled={loading} onClick={() => void loadExtensions()}>{t('extensions.refreshList')}</button>
         </div>
       </div>
@@ -4691,6 +4832,7 @@ function ExtensionsManager() {
         </div>
         {thirdPartyExtensions.length ? thirdPartyExtensions.map((extension) => {
           const manifest = extension.manifest || {};
+          const canUpdateGit = Boolean(extension.source && /^(https?:|git@)/i.test(extension.source));
           return (
             <article className={extension.enabled ? 'extension-row enabled' : 'extension-row'} key={extension.name}>
               <div className="extension-row-main">
@@ -4699,8 +4841,9 @@ function ExtensionsManager() {
                 <small>{extension.source || t('extensions.localInstall')}</small>
               </div>
               <div className="extension-row-actions">
-                <span className="extension-status">{t('extensions.unstable')}</span>
+                <span className={extension.enabled ? 'extension-status enabled' : 'extension-status'}>{extension.enabled ? t('common.enabled') : t('common.disabled')}</span>
                 <button className="ghost-button" type="button" disabled={loading || !extension.enabled} onClick={() => openExtensionSettingsPanel(extension)}>{t('common.settings')}</button>
+                {canUpdateGit ? <button className="ghost-button" type="button" disabled={loading} onClick={() => void updateExtension(extension)}>{t('extensions.update')}</button> : null}
                 <button type="button" disabled={loading} onClick={() => void setEnabled(extension, !extension.enabled)}>{extension.enabled ? t('common.disable') : t('common.enable')}</button>
                 <button className="ghost-button danger-button" type="button" disabled={loading} onClick={() => void deleteExtension(extension)}>{t('common.delete')}</button>
               </div>

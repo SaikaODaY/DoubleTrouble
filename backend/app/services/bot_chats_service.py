@@ -81,13 +81,19 @@ class ChatSwipeRequest(BaseModel):
 class BotChatsService:
     def __init__(self, chats_dir: Path) -> None:
         self.chats_dir = chats_dir
+        self._summary_cache: dict[Path, tuple[int, int, BotChatSummary]] = {}
 
     def list_chats(self, card_id: str) -> list[BotChatSummary]:
         directory = self._card_chat_dir(card_id)
         if not directory.exists():
             return []
-        return [self._summary(path) for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)]
-
+        summaries: list[BotChatSummary] = []
+        for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                summaries.append(self._summary(path))
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError):
+                continue
+        return summaries
     def get_chat(self, card_id: str, chat_id: str) -> BotChat:
         path = self._chat_path(card_id, chat_id)
         if not path.exists():
@@ -130,6 +136,7 @@ class BotChatsService:
         path = self._chat_path(card_id, chat_id)
         if not path.exists():
             raise FileNotFoundError(chat_id)
+        self._summary_cache.pop(path, None)
         path.unlink()
 
     def delete_card_chats(self, card_id: str) -> None:
@@ -137,6 +144,7 @@ class BotChatsService:
         if not directory.exists():
             return
         for path in directory.glob("*.json"):
+            self._summary_cache.pop(path, None)
             path.unlink()
         try:
             directory.rmdir()
@@ -180,6 +188,60 @@ class BotChatsService:
                 row["extra"] = {"doubletrouble_hidden": True}
             rows.append(row)
         return "\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in rows) + "\n"
+
+    def import_sillytavern_chat(self, card_id: str, character_name: str, filename: str, content_text: str) -> BotChat:
+        stripped = content_text.strip()
+        if not stripped:
+            raise ValueError("Chat file is empty")
+        title = Path(filename or "Imported Chat").stem
+        messages: list[BotChatMessage] = []
+        if stripped.startswith("{") and "\n" not in stripped:
+            try:
+                parsed_single = json.loads(stripped)
+                if isinstance(parsed_single, dict) and isinstance(parsed_single.get("messages"), list):
+                    chat = BotChat.model_validate({**parsed_single, "id": str(uuid4()), "card_id": card_id, "character_name": character_name or parsed_single.get("character_name") or "Character"})
+                    self._save(chat)
+                    return chat
+            except (json.JSONDecodeError, ValueError):
+                pass
+        for line in stripped.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
+            if "chat_metadata" in row and "mes" not in row:
+                meta = row.get("chat_metadata")
+                if isinstance(meta, dict) and str(meta.get("title") or "").strip():
+                    title = str(meta["title"]).strip()
+                continue
+            mes = str(row.get("mes") or "").strip()
+            if not mes:
+                continue
+            is_system = bool(row.get("is_system"))
+            is_user = bool(row.get("is_user"))
+            role = "system" if is_system else "user" if is_user else "assistant"
+            author = str(row.get("name") or ("System" if is_system else "Player" if is_user else character_name or "Bot"))
+            swipes_raw = row.get("swipes")
+            swipes = [str(s) for s in swipes_raw if str(s).strip()] if isinstance(swipes_raw, list) else ([mes] if role == "assistant" else [])
+            swipe_id = int(row.get("swipe_id") or 0) if isinstance(row.get("swipe_id"), (int, float)) else 0
+            active_swipe_index = max(0, min(swipe_id, len(swipes) - 1)) if swipes else 0
+            extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+            hidden = bool(extra.get("doubletrouble_hidden") or row.get("is_hidden"))
+            messages.append(
+                BotChatMessage(
+                    role=role,
+                    author=author,
+                    content=swipes[active_swipe_index] if role == "assistant" and swipes else mes,
+                    swipes=swipes,
+                    active_swipe_index=active_swipe_index,
+                    hidden=hidden,
+                )
+            )
+        chat = BotChat(card_id=card_id, character_name=character_name or "Character", title=title, messages=messages)
+        self._save(chat)
+        return chat
 
     def add_message(self, card_id: str, chat_id: str, request: ChatMessageCreate) -> BotChat:
         chat = self.get_chat(card_id, chat_id)
@@ -321,10 +383,27 @@ class BotChatsService:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{chat.id}.json"
         path.write_text(json.dumps(chat.model_dump(mode="json"), ensure_ascii=False, indent=2), encoding="utf-8")
+        st = path.stat()
+        self._summary_cache[path] = (
+            st.st_mtime_ns,
+            st.st_size,
+            BotChatSummary(
+                id=chat.id,
+                title=chat.title,
+                filename=path.name,
+                message_count=len(chat.messages),
+                created_at=chat.created_at,
+                updated_at=chat.updated_at,
+            ),
+        )
 
     def _summary(self, path: Path) -> BotChatSummary:
+        st = path.stat()
+        cached = self._summary_cache.get(path)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
         chat = BotChat.model_validate(json.loads(path.read_text(encoding="utf-8")))
-        return BotChatSummary(
+        summary = BotChatSummary(
             id=chat.id,
             title=chat.title,
             filename=path.name,
@@ -332,3 +411,5 @@ class BotChatsService:
             created_at=chat.created_at,
             updated_at=chat.updated_at,
         )
+        self._summary_cache[path] = (st.st_mtime_ns, st.st_size, summary)
+        return summary

@@ -53,14 +53,23 @@ class CharacterCardUpdate(CharacterCardCreate):
 class CharacterCardsService:
     def __init__(self, characters_dir: Path) -> None:
         self.characters_dir = characters_dir
+        self._cache: dict[Path, tuple[int, int, dict[str, Any], CharacterCardSummary]] = {}
+        self._id_to_path: dict[str, Path] = {}
 
     def list_cards(self) -> list[CharacterCardSummary]:
         self.characters_dir.mkdir(parents=True, exist_ok=True)
         cards: list[CharacterCardSummary] = []
-        for path in sorted(self.characters_dir.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True):
+        paths_with_mtime: list[tuple[float, Path]] = []
+        for path in self.characters_dir.glob("*.png"):
+            try:
+                paths_with_mtime.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        paths_with_mtime.sort(key=lambda item: item[0], reverse=True)
+        for _, path in paths_with_mtime:
             try:
                 cards.append(self._summary_from_file(path))
-            except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
         return cards
 
@@ -125,6 +134,8 @@ class CharacterCardsService:
         if path is None:
             raise FileNotFoundError(card_id)
         summary = self._summary_from_file(path)
+        self._cache.pop(path, None)
+        self._id_to_path.pop(card_id, None)
         path.unlink()
         return summary
 
@@ -138,8 +149,8 @@ class CharacterCardsService:
         path = self._path_from_card_id(card_id)
         if path is None:
             raise FileNotFoundError(card_id)
-        return self._card_data(self.read_card_metadata(path.read_bytes()))
-
+        metadata, _ = self._cached_from_file(path)
+        return self._card_data(metadata)
     def read_card_metadata(self, content: bytes) -> dict[str, Any]:
         text_chunks = self._read_png_text_chunks(content)
         encoded = text_chunks.get("ccv3") or text_chunks.get("chara")
@@ -157,10 +168,20 @@ class CharacterCardsService:
             raise ValueError("JSON card has no character name")
         return metadata
 
-    def _summary_from_file(self, path: Path) -> CharacterCardSummary:
-        metadata = self.read_card_metadata(path.read_bytes())
-        return self._summary_from_metadata(path, metadata)
+    def _cached_from_file(self, path: Path) -> tuple[dict[str, Any], CharacterCardSummary]:
+        st = path.stat()
+        cached = self._cache.get(path)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2], cached[3]
+        metadata = self._read_card_metadata_from_path(path)
+        summary = self._summary_from_metadata(path, metadata)
+        self._cache[path] = (st.st_mtime_ns, st.st_size, metadata, summary)
+        self._id_to_path[summary.id] = path
+        return metadata, summary
 
+    def _summary_from_file(self, path: Path) -> CharacterCardSummary:
+        _, summary = self._cached_from_file(path)
+        return summary
     def _summary_from_metadata(self, path: Path, metadata: dict[str, Any]) -> CharacterCardSummary:
         data = self._card_data(metadata)
         tags = data.get("tags") or metadata.get("tags") or []
@@ -193,6 +214,59 @@ class CharacterCardsService:
             return [raw]
         return []
 
+    def _read_card_metadata_from_path(self, path: Path) -> dict[str, Any]:
+        chunks: dict[str, str] = {}
+        with path.open("rb") as f:
+            if f.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE:
+                raise ValueError("Not a PNG file")
+            while True:
+                header = f.read(8)
+                if len(header) < 8:
+                    break
+                length = int.from_bytes(header[:4], "big")
+                chunk_type = header[4:8].decode("ascii", errors="replace")
+                if chunk_type in {"tEXt", "zTXt", "iTXt"} and length <= 16 * 1024 * 1024:
+                    chunk_data = f.read(length)
+                    f.seek(4, 1)
+                    self._parse_text_chunk(chunk_type, chunk_data, chunks)
+                elif chunk_type == "IEND":
+                    break
+                else:
+                    f.seek(length + 4, 1)
+        encoded = chunks.get("ccv3") or chunks.get("chara")
+        if not encoded:
+            raise ValueError("PNG card has no chara/ccv3 metadata")
+        decoded = base64.b64decode(encoded).decode("utf-8")
+        return json.loads(decoded)
+
+    def _parse_text_chunk(self, chunk_type: str, chunk_data: bytes, chunks: dict[str, str]) -> None:
+        if b"\x00" not in chunk_data:
+            return
+        if chunk_type == "tEXt":
+            keyword, text = chunk_data.split(b"\x00", 1)
+            chunks[keyword.decode("latin-1", errors="ignore").lower()] = text.decode("latin-1", errors="ignore")
+        elif chunk_type == "zTXt":
+            keyword, rest = chunk_data.split(b"\x00", 1)
+            if len(rest) > 1 and rest[0] == 0:
+                try:
+                    decompressed = zlib.decompress(rest[1:])
+                    chunks[keyword.decode("latin-1", errors="ignore").lower()] = decompressed.decode("latin-1", errors="ignore")
+                except zlib.error:
+                    pass
+        elif chunk_type == "iTXt":
+            keyword, rest = chunk_data.split(b"\x00", 1)
+            if len(rest) >= 2:
+                comp_flag = rest[0]
+                parts = rest[2:].split(b"\x00", 2)
+                if len(parts) == 3:
+                    raw_text = parts[2]
+                    try:
+                        if comp_flag == 1:
+                            raw_text = zlib.decompress(raw_text)
+                        chunks[keyword.decode("latin-1", errors="ignore").lower()] = raw_text.decode("utf-8", errors="ignore")
+                    except zlib.error:
+                        pass
+
     def _read_png_text_chunks(self, content: bytes) -> dict[str, str]:
         if not content.startswith(PNG_SIGNATURE):
             raise ValueError("Not a PNG file")
@@ -208,14 +282,12 @@ class CharacterCardsService:
                 break
 
             chunk_data = content[data_start:data_end]
-            if chunk_type == "tEXt" and b"\x00" in chunk_data:
-                keyword, text = chunk_data.split(b"\x00", 1)
-                chunks[keyword.decode("latin-1").lower()] = text.decode("latin-1")
+            if chunk_type in {"tEXt", "zTXt", "iTXt"}:
+                self._parse_text_chunk(chunk_type, chunk_data, chunks)
             if chunk_type == "IEND":
                 break
             offset = data_end + 4
         return chunks
-
     def _write_card_metadata(self, content: bytes, metadata: dict[str, Any]) -> bytes:
         chunks = self._split_png_chunks(content)
         metadata_json = json.dumps(metadata, ensure_ascii=False)
@@ -299,12 +371,16 @@ class CharacterCardsService:
         return f"card_{digest}"
 
     def _path_from_card_id(self, card_id: str) -> Path | None:
+        cached_path = self._id_to_path.get(card_id)
+        if cached_path is not None and cached_path.exists():
+            return cached_path
         self.characters_dir.mkdir(parents=True, exist_ok=True)
         for path in self.characters_dir.glob("*.png"):
-            if self._card_id(path) == card_id or path.name == card_id:
+            cid = self._card_id(path)
+            self._id_to_path[cid] = path
+            if cid == card_id or path.name == card_id:
                 return path
         return None
-
     def _unique_path(self, stem: str, suffix: str) -> Path:
         self.characters_dir.mkdir(parents=True, exist_ok=True)
         path = self.characters_dir / f"{stem}{suffix}"

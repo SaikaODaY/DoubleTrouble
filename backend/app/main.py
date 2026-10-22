@@ -10,8 +10,8 @@ import time
 
 import httpx
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlparse
-
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -86,7 +86,7 @@ class BotReplyRequest(BaseModel):
     persona_description: str | None = None
     participants: list[GenerationParticipantRequest] = Field(default_factory=list)
     regex_scripts: list[dict[str, object]] = Field(default_factory=list)
-
+    extension_prompts: list[dict[str, object]] = Field(default_factory=list)
 
 class AuthRequest(BaseModel):
     username: str
@@ -584,10 +584,36 @@ async def sillytavern_version() -> dict[str, str]:
 @app.post("/api/settings/get")
 async def sillytavern_settings_get(request: Request) -> dict[str, object]:
     _require_permission(request, "view_presets")
+    ext_settings = extensions_service.get_settings()
+    gen_settings = settings_service.generation_settings()
     return {
-        "world_names": [book.name for book in lorebooks_service.list_lorebooks()],
-        "settings": settings_service.generation_settings(),
+        "world_names": [book.name for book in lorebooks_service.list_books()],
+        "settings": {**gen_settings, "extension_settings": ext_settings},
+        "extension_settings": ext_settings,
     }
+
+
+@app.post("/api/settings/save")
+async def sillytavern_settings_save(payload: dict[str, Any], request: Request) -> dict[str, object]:
+    ext_patch = payload.get("extension_settings") if isinstance(payload.get("extension_settings"), dict) else payload
+    if isinstance(ext_patch, dict):
+        extensions_service.save_settings(ext_patch, merge=True)
+        await _broadcast_shared_settings("extension_settings")
+    return {"ok": True}
+
+
+@app.get("/api/extensions/settings")
+async def get_extension_settings() -> dict[str, object]:
+    return {"extension_settings": extensions_service.get_settings()}
+
+
+@app.put("/api/extensions/settings")
+async def put_extension_settings(payload: dict[str, Any], request: Request) -> dict[str, object]:
+    patch = payload.get("extension_settings") if isinstance(payload.get("extension_settings"), dict) else payload
+    merge = bool(payload.get("merge", True)) if isinstance(payload, dict) else True
+    saved = extensions_service.save_settings(patch if isinstance(patch, dict) else {}, merge=merge)
+    await _broadcast_shared_settings("extension_settings")
+    return {"ok": True, "extension_settings": saved}
 
 
 @app.get("/api/extensions/discover")
@@ -602,9 +628,53 @@ async def list_extensions(request: Request) -> dict[str, object]:
 
 
 @app.post("/api/extensions/install")
-async def install_extension(_payload: ExtensionInstallRequest, request: Request) -> dict[str, object]:
+async def install_extension(payload: ExtensionInstallRequest, request: Request) -> dict[str, object]:
     _require_permission(request, "manage_extensions")
-    raise HTTPException(status_code=403, detail="Extension installation is temporarily disabled")
+    try:
+        extension = await asyncio.to_thread(extensions_service.install, payload)
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail=f"Extension already exists: {error}") from error
+    except (ValueError, FileNotFoundError, RuntimeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("extensions")
+    await _broadcast_notification(f"установил расширение: {extension.name}", actor=_actor_from_request(request))
+    return {"extension": extension.model_dump(mode="json")}
+
+
+@app.post("/api/extensions/upload")
+async def upload_extension_zip(
+    request: Request,
+    file: UploadFile = File(...),
+    name: str = Form(""),
+    overwrite: bool = Form(True),
+) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip extension archives are supported")
+    content = await file.read()
+    try:
+        extension = await asyncio.to_thread(extensions_service.install_zip, file.filename, content, name, True, overwrite)
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail=f"Extension already exists: {error}") from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("extensions")
+    await _broadcast_notification(f"загрузил расширение из ZIP: {extension.name}", actor=_actor_from_request(request))
+    return {"extension": extension.model_dump(mode="json")}
+
+
+@app.post("/api/extensions/{name}/update")
+async def update_extension(name: str, request: Request) -> dict[str, object]:
+    _require_permission(request, "manage_extensions")
+    try:
+        extension = await asyncio.to_thread(extensions_service.update, name)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Extension not found") from error
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_shared_settings("extensions")
+    await _broadcast_notification(f"обновил расширение: {extension.name}", actor=_actor_from_request(request))
+    return {"extension": extension.model_dump(mode="json")}
 
 
 @app.put("/api/extensions/{name}/enabled")
@@ -633,14 +703,15 @@ async def delete_extension(name: str, request: Request) -> dict[str, object]:
 
 @app.get("/scripts/extensions/{extension_path:path}")
 @app.head("/scripts/extensions/{extension_path:path}")
-async def extension_asset(extension_path: str, request: Request) -> Response:
-    _require_permission(request, "manage_extensions")
+async def extension_asset(extension_path: str) -> Response:
     if extension_path == "extensions.js":
         return await extension_compat_module()
     if extension_path == "regex/engine.js":
         return _compat_javascript("""
-export const regex_placement = { RAW: 0, USER_INPUT: 1, AI_OUTPUT: 2, SLASH_COMMAND: 3 };
-export const getRegexedString = (value) => String(value ?? '');
+const dtRegex = () => globalThis.DoubleTroubleRegex || {};
+export const regex_placement = { MD_DISPLAY: 0, RAW: 0, USER_INPUT: 1, AI_OUTPUT: 2, SLASH_COMMAND: 3, WORLD_INFO: 5, REASONING: 6 };
+export const getRegexedString = (value, placement = 2, params = {}) => dtRegex().getRegexedString ? dtRegex().getRegexedString(String(value ?? ''), placement, params) : String(value ?? '');
+export const runRegexScript = (script, value, params = {}) => dtRegex().runRegexScript ? dtRegex().runRegexScript(script, String(value ?? ''), params) : String(value ?? '');
 """)
     try:
         path = extensions_service.file_path(extension_path)
@@ -659,14 +730,19 @@ export const modules = [];
 export const extensionTypes = { SYSTEM: 'system', LOCAL: 'local', GLOBAL: 'global', THIRD_PARTY: 'third-party' };
 export const getContext = () => ctx();
 export const getApiUrl = () => extension_settings.apiUrl || '';
-export const ModuleWorkerWrapper = class {};
-export const renderExtensionTemplateAsync = async (extensionName, templateId) => {
-  const response = await fetch(`/scripts/extensions/${extensionName}/${templateId}.html`);
+export const ModuleWorkerWrapper = class { constructor(fn) { this.fn = fn; } update(...args) { return this.fn?.(...args); } };
+export const renderExtensionTemplateAsync = async (extensionName, templateId, templateData = {}) => {
+  if (ctx().renderExtensionTemplateAsync) return await ctx().renderExtensionTemplateAsync(extensionName, templateId, templateData);
+  const cleanId = String(templateId || '').replace(/\\.html$/i, '');
+  const response = await fetch(`/scripts/extensions/${extensionName}/${cleanId}.html`);
   return response.ok ? await response.text() : '';
 };
-export const renderExtensionTemplate = () => '';
-export const saveMetadataDebounced = () => {};
-export const writeExtensionField = async () => {};
+export const renderExtensionTemplate = (extensionName, templateId, templateData = {}) => {
+  if (ctx().renderExtensionTemplate) return ctx().renderExtensionTemplate(extensionName, templateId, templateData);
+  return '';
+};
+export const saveMetadataDebounced = () => ctx().saveMetadataDebounced?.();
+export const writeExtensionField = async (characterId, key, value) => ctx().writeExtensionField?.(characterId, key, value);
 export const doExtrasFetch = (endpoint, args = {}) => fetch(endpoint, args);
 """.strip()
     return Response(content=content, media_type="text/javascript; charset=utf-8")
@@ -686,47 +762,55 @@ async def script_compat_module() -> Response:
 const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
 export const eventSource = ctx().eventSource;
 export const event_types = ctx().event_types || ctx().eventTypes || {};
-export const saveSettingsDebounced = ctx().saveSettingsDebounced || (() => {});
+export const saveSettingsDebounced = (...args) => ctx().saveSettingsDebounced?.(...args);
 export const saveSettings = saveSettingsDebounced;
-export const getRequestHeaders = ctx().getRequestHeaders || (() => ({}));
-export const messageFormatting = ctx().messageFormatting || ((text) => text);
-export const saveChatConditional = ctx().saveChat || (async () => {});
+export const getRequestHeaders = () => (ctx().getRequestHeaders ? ctx().getRequestHeaders() : { 'Content-Type': 'application/json' });
+export const messageFormatting = (...args) => (ctx().messageFormatting ? ctx().messageFormatting(...args) : String(args[0] ?? ''));
+export const saveChatConditional = () => (ctx().saveChat ? ctx().saveChat() : Promise.resolve());
+export const saveChatDebounced = saveChatConditional;
 export const chat = [];
 export const characters = [];
 export const personas = [];
-export const chat_metadata = {};
-export const extension_prompts = {};
+export const chat_metadata = ctx().chatMetadata || {};
+export const extension_prompts = ctx().extensionPrompts || {};
+export let name1 = ctx().name1 || 'User';
+export let name2 = ctx().name2 || 'Char';
+export let this_chid = ctx().characterId ?? 0;
+export let user_avatar = ctx().selectedPersona?.avatar || '';
 const sync = () => {
-  chat.splice(0, chat.length, ...(ctx().chat || []));
-  characters.splice(0, characters.length, ...(ctx().characters || []));
-  personas.splice(0, personas.length, ...(ctx().personas || []));
+  const c = ctx();
+  chat.splice(0, chat.length, ...(c.chat || []));
+  characters.splice(0, characters.length, ...(c.characters || []));
+  personas.splice(0, personas.length, ...(c.personas || []));
+  name1 = c.name1 || 'User';
+  name2 = c.name2 || 'Char';
+  this_chid = c.characterId ?? 0;
+  user_avatar = c.selectedPersona?.avatar || '';
 };
 sync();
-globalThis.setInterval?.(sync, 250);
-export const name1 = ctx().name1 || 'User';
-export const name2 = ctx().name2 || 'Char';
-export const this_chid = ctx().characterId ?? 0;
-export const user_avatar = ctx().selectedPersona?.avatar || '';
+globalThis.setInterval?.(sync, 200);
 export const system_avatar = 'system.png';
 export const default_avatar = 'default.png';
 export const is_send_press = false;
 export const main_api = 'openai';
 export const online_status = 'connected';
 export const MAX_INJECTION_DEPTH = 1000;
-export const system_message_types = { NARRATOR: 'narrator', COMMENT: 'comment' };
+export const system_message_types = { NARRATOR: 'narrator', COMMENT: 'comment', GENERIC: 'generic' };
 export const extension_prompt_roles = { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
-export const extension_prompt_types = { IN_CHAT: 0, BEFORE_PROMPT: 1, IN_PROMPT: 2, AFTER_PROMPT: 3 };
-export const getCurrentChatId = () => 'default';
+export const extension_prompt_types = { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2, AFTER_PROMPT: 3 };
+export const getCurrentChatId = () => ctx().chatId || 'default';
 export const getThumbnailUrl = (_type, file) => file?.startsWith?.('/') ? file : `/api/personas/avatars/${encodeURIComponent(file || 'default.png')}`;
-export const reloadMarkdownProcessor = () => ({ makeHtml: (text) => String(text ?? '') });
+export const reloadMarkdownProcessor = () => ({ makeHtml: (text) => messageFormatting(text) });
 export const clearChat = async () => {};
 export const printMessages = async () => {};
-export const addOneMessage = async () => {};
+export const addOneMessage = async (mes, opts) => ctx().addOneMessage?.(mes, opts);
+export const sendSystemMessage = async (type, text, extra) => ctx().sendSystemMessage?.(type, text, extra);
+export const deleteLastMessage = async () => ctx().deleteLastMessage?.();
 export const getPastCharacterChats = async () => [];
 export const showSwipeButtons = () => {};
-export const substituteParams = (text) => String(text ?? '').replaceAll('{{user}}', ctx().name1 || 'User').replaceAll('{{char}}', ctx().name2 || 'Char');
-export const substituteParamsExtended = substituteParams;
-export const saveMetadata = async () => {};
+export const substituteParams = (text, ...rest) => ctx().substituteParams ? ctx().substituteParams(text, ...rest) : String(text ?? '').replaceAll('{{user}}', ctx().name1 || 'User').replaceAll('{{char}}', ctx().name2 || 'Char');
+export const substituteParamsExtended = (text, ...rest) => ctx().substituteParamsExtended ? ctx().substituteParamsExtended(text, ...rest) : substituteParams(text);
+export const saveMetadata = async () => ctx().saveMetadata?.();
 export const saveCharacterDebounced = () => {};
 export const getOneCharacter = (id) => characters[Number(id)] || characters[0] || null;
 export const selectCharacterById = async () => {};
@@ -735,22 +819,24 @@ export const unshallowCharacter = async (character) => character;
 export const deleteCharacter = async () => {};
 export const getCharacters = async () => characters;
 export const scrollChatToBottom = () => globalThis.scrollTo?.({ top: document.body.scrollHeight, behavior: 'smooth' });
-export const reloadCurrentChat = async () => {};
+export const reloadCurrentChat = async () => ctx().reloadCurrentChat?.();
 export const activateSendButtons = () => {};
 export const deactivateSendButtons = () => {};
 export const setGenerationProgress = () => {};
-export const setExtensionPrompt = (name, value) => { extension_prompts[name] = value; };
-export const baseChatReplace = (text) => text;
+export const setExtensionPrompt = (key, value, position = 1, depth = 4, scan = false, role = 0) => ctx().setExtensionPrompt ? ctx().setExtensionPrompt(key, value, position, depth, scan, role) : (extension_prompts[key] = { value, position, depth, scan, role });
+export const baseChatReplace = (text) => substituteParams(text);
 export const getCharacterCardFields = () => ({});
 export const getBiasStrings = () => [];
 export const getExtensionPromptRoleByName = (role) => extension_prompt_roles[String(role).toUpperCase()] ?? extension_prompt_roles.SYSTEM;
-export const getMaxContextSize = () => 8192;
-export const getExtensionPromptByName = (name) => extension_prompts[name] || '';
+export const getMaxContextSize = () => ctx().maxContext || 8192;
+export const getExtensionPromptByName = (name) => extension_prompts[name]?.value ?? extension_prompts[name] ?? '';
 export const cleanUpMessage = (text) => String(text ?? '');
 export const isOdd = (value) => Number(value) % 2 !== 0;
 export const countOccurrences = (text, value) => String(text ?? '').split(String(value ?? '')).length - 1;
-export const stopGeneration = async () => {};
-export const Generate = async () => '';
+export const stopGeneration = async () => ctx().stopGeneration?.();
+export const generateQuietPrompt = async (...args) => ctx().generateQuietPrompt ? await ctx().generateQuietPrompt(...args) : '';
+export const generateRaw = async (...args) => ctx().generateRaw ? await ctx().generateRaw(...args) : '';
+export const Generate = async (type, opts = {}) => ctx().Generate ? await ctx().Generate(type, opts) : await generateQuietPrompt(opts?.quiet_prompt || '');
 export default {};
 """.strip()
     return Response(content=content, media_type="text/javascript; charset=utf-8")
@@ -931,14 +1017,20 @@ export class PromptCollection extends Array {}
 """,
         "sse-stream.js": "export const getEventSourceStream = async () => null;",
         "slash-commands.js": """
-export const slashCommandRegistry = new Map();
-export const executeSlashCommandsWithOptions = async (text) => String(text ?? '');
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const slashCommandRegistry = globalThis.__dtSlashCommands ?? (globalThis.__dtSlashCommands = new Map());
+export const registerSlashCommand = (name, callback, aliases = [], helpString = '') => {
+  if (ctx().registerSlashCommand) return ctx().registerSlashCommand(name, callback, aliases, helpString);
+  slashCommandRegistry.set(String(name), { name, callback, aliases, helpString });
+};
+export const executeSlashCommands = async (text, ...rest) => ctx().executeSlashCommands ? await ctx().executeSlashCommands(text, ...rest) : String(text ?? '');
+export const executeSlashCommandsWithOptions = async (text, opts = {}) => ctx().executeSlashCommandsWithOptions ? await ctx().executeSlashCommandsWithOptions(text, opts) : String(text ?? '');
 """,
         "slash-commands/SlashCommand.js": """
 export class SlashCommand { constructor(data = {}) { Object.assign(this, data); } static fromProps(data = {}) { return new SlashCommand(data); } }
 """,
         "slash-commands/SlashCommandArgument.js": """
-export const ARGUMENT_TYPE = { STRING: 'string', NUMBER: 'number', BOOLEAN: 'boolean', VARIABLE_NAME: 'variable_name' };
+export const ARGUMENT_TYPE = { STRING: 'string', NUMBER: 'number', BOOLEAN: 'boolean', VARIABLE_NAME: 'variable_name', LIST: 'list', DICTIONARY: 'dictionary', SUBCOMMAND: 'subcommand' };
 export class SlashCommandArgument { constructor(data = {}) { Object.assign(this, data); } static fromProps(data = {}) { return new SlashCommandArgument(data); } }
 export class SlashCommandNamedArgument extends SlashCommandArgument {}
 """,
@@ -953,20 +1045,70 @@ export const commonEnumProviders = {
 };
 """,
         "slash-commands/SlashCommandEnumValue.js": """
-export const enumTypes = { enum: 'enum' };
+export const enumTypes = { enum: 'enum', name: 'name', command: 'command' };
 export class SlashCommandEnumValue { constructor(value, description = '', type = enumTypes.enum, icon = '') { this.value = value; this.description = description || ''; this.type = type; this.icon = icon || ''; } }
 """,
         "slash-commands/SlashCommandParser.js": """
-export class SlashCommandParser { static addCommandObject(command) { globalThis.__dtSlashCommands ??= new Map(); globalThis.__dtSlashCommands.set(command?.name || command?.command || String(globalThis.__dtSlashCommands.size), command); } static parse(text) { return { command: String(text ?? ''), args: [] }; } }
+export class SlashCommandParser {
+  static get commands() { globalThis.__dtSlashCommands ??= new Map(); return Object.fromEntries(globalThis.__dtSlashCommands); }
+  static addCommandObject(command) {
+    globalThis.__dtSlashCommands ??= new Map();
+    const name = command?.name || command?.command;
+    if (name) {
+      globalThis.__dtSlashCommands.set(String(name), command);
+      if (Array.isArray(command?.aliases)) {
+        command.aliases.forEach((alias) => alias && globalThis.__dtSlashCommands.set(String(alias), command));
+      }
+    }
+  }
+  static parse(text) { return { command: String(text ?? ''), args: [] }; }
+}
 """,
         "popup.js": """
-export const POPUP_TYPE = { TEXT: 0, CONFIRM: 1, INPUT: 2, DISPLAY: 3 };
-export const callGenericPopup = async (content, _type, _input, options = {}) => { if (options?.okButton) return true; return content; };
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const POPUP_TYPE = { TEXT: 1, CONFIRM: 2, INPUT: 3, DISPLAY: 4, CROP: 5 };
+export const POPUP_RESULT = { AFFIRMATIVE: 1, NEGATIVE: 0, CANCELLED: null };
+export const callGenericPopup = async (content, type = 1, inputValue = '', options = {}) => {
+  if (ctx().callGenericPopup) return await ctx().callGenericPopup(content, type, inputValue, options);
+  if (type === POPUP_TYPE.CONFIRM) return globalThis.confirm?.(typeof content === 'string' ? content.replace(/<[^>]+>/g, '') : 'Confirm?') ? 1 : 0;
+  if (type === POPUP_TYPE.INPUT) return globalThis.prompt?.(typeof content === 'string' ? content.replace(/<[^>]+>/g, '') : 'Input:', String(inputValue ?? ''));
+  return 1;
+};
+export const callPopup = callGenericPopup;
+export class Popup {
+  constructor(content, type = 1, inputValue = '', options = {}) {
+    this.content = content;
+    this.type = type;
+    this.inputValue = inputValue;
+    this.options = options;
+    this.value = inputValue;
+    this.result = 1;
+  }
+  async show() {
+    const out = await callGenericPopup(this.content, this.type, this.inputValue, this.options);
+    this.value = out;
+    this.result = out ? 1 : 0;
+    return out;
+  }
+  static get util() { return { POPUP_TYPE, POPUP_RESULT }; }
+}
 """,
-        "tokenizers.js": "export const getTokenCountAsync = async (text) => Math.ceil(String(text ?? '').length / 4);",
+        "tokenizers.js": "export const getTokenCountAsync = async (text) => Math.ceil(String(text ?? '').length / 4); export const getTokenCount = (text) => Math.ceil(String(text ?? '').length / 4);",
+        "templates.js": """
+const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
+export const renderTemplateAsync = async (templateId, data = {}) => ctx().renderExtensionTemplateAsync ? await ctx().renderExtensionTemplateAsync('', templateId, data) : '';
+export const renderTemplate = (templateId, data = {}) => ctx().renderExtensionTemplate ? ctx().renderExtensionTemplate('', templateId, data) : '';
+""",
+        "group-chats.js": "export const groups = []; export const selected_group = null; export const is_group_generating = false; export const getGroupAvatar = () => '';",
+        "tags.js": "export const tags = []; export const tag_map = {}; export const getTagsList = () => [];",
+        "chats.js": "export const saveChat = async () => globalThis.SillyTavern?.getContext?.().saveChat?.();",
+        "char-data.js": "export const char_data = {};",
+        "custom-request.js": "export class CustomRequest { async send() { return {}; } }",
     }
     if module_path in modules:
         return _compat_javascript(modules[module_path])
+    if module_path.startswith("extensions/"):
+        return await extension_asset(module_path.removeprefix("extensions/"))
     raise HTTPException(status_code=404, detail="Compatibility script not found")
 
 
@@ -1005,11 +1147,50 @@ async def extension_image(folder: str, filename: str, request: Request) -> FileR
 
 @app.get("/user/files/{filename}")
 @app.head("/user/files/{filename}")
-async def extension_file(filename: str, request: Request) -> FileResponse:
+async def extension_file(filename: str) -> FileResponse:
     path = storage.user_root / "user" / "files" / Path(filename).name
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path)
+
+
+@app.post("/api/backends/chat-completions/generate")
+@app.post("/api/extensions/generate")
+async def extension_chat_completions_generate(payload: dict[str, Any], request: Request) -> dict[str, object]:
+    _require_permission(request, "generate")
+    from backend.app.llm.base import ChatMessage
+    raw_messages = payload.get("messages")
+    chat_messages: list[ChatMessage] = []
+    if isinstance(raw_messages, list) and raw_messages:
+        for item in raw_messages:
+            if isinstance(item, dict) and str(item.get("content") or "").strip():
+                role = str(item.get("role") or "user").lower()
+                if role not in {"system", "user", "assistant"}:
+                    role = "user"
+                chat_messages.append(ChatMessage(role=role, content=str(item.get("content"))))
+    else:
+        sys_prompt = str(payload.get("system_prompt") or payload.get("systemPrompt") or "").strip()
+        if sys_prompt:
+            chat_messages.append(ChatMessage(role="system", content=sys_prompt))
+        prompt_text = str(payload.get("prompt") or payload.get("quiet_prompt") or payload.get("quietPrompt") or "").strip()
+        if prompt_text:
+            chat_messages.append(ChatMessage(role="user", content=prompt_text))
+    if not chat_messages:
+        raise HTTPException(status_code=400, detail="Prompt or messages are required")
+    max_tokens_raw = payload.get("max_tokens") or payload.get("responseLength")
+    max_tokens = int(max_tokens_raw) if isinstance(max_tokens_raw, (int, float)) and int(max_tokens_raw) > 0 else None
+    temp_raw = payload.get("temperature")
+    temperature = float(temp_raw) if isinstance(temp_raw, (int, float)) else None
+    try:
+        text = await generation_service.raw_generate(chat_messages, max_tokens=max_tokens, temperature=temperature)
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return {
+        "ok": True,
+        "text": text,
+        "content": text,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+    }
 
 
 @app.post("/api/avatars/get")
@@ -1781,10 +1962,26 @@ async def import_character_card(request: Request, file: UploadFile = File(...)) 
         card = character_cards_service.import_card(file.filename, await file.read())
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    imported_regex_scripts: list[dict[str, Any]] = []
+    try:
+        card_data = character_cards_service.card_data(card.id)
+        char_book = card_data.get("character_book")
+        if isinstance(char_book, dict) and char_book.get("entries"):
+            book_name = str(char_book.get("name") or f"{card.name}_Lorebook").strip()
+            saved_book = lorebooks_service.save_book(LorebookPayload(name=book_name, book=char_book))
+            existing_bindings = lorebooks_service.bindings()
+            if not any(b.book == saved_book.name and b.target_type == "card" and b.target_id == card.id for b in existing_bindings):
+                from backend.app.services.lorebooks_service import LorebookBinding
+                lorebooks_service.save_bindings([*existing_bindings, LorebookBinding(book=saved_book.name, target_type="card", target_id=card.id)])
+                await _broadcast_shared_settings("lorebooks")
+        ext_data = card_data.get("extensions")
+        if isinstance(ext_data, dict) and isinstance(ext_data.get("regex_scripts"), list):
+            imported_regex_scripts = [item for item in ext_data["regex_scripts"] if isinstance(item, dict)]
+    except Exception:
+        pass
     await _broadcast_shared_settings("cards")
     await _broadcast_notification(f"импортировал карточку: {card.name}", actor=_actor_from_request(request))
-    return {"card": card.model_dump(mode="json")}
-
+    return {"card": card.model_dump(mode="json"), "regex_scripts": imported_regex_scripts}
 
 @app.post("/api/cards")
 async def create_character_card(
@@ -1960,6 +2157,24 @@ async def export_bot_chat_sillytavern(card_id: str, chat_id: str, request: Reque
     )
 
 
+@app.post("/api/cards/{card_id}/chats/import")
+async def import_bot_chat_sillytavern(card_id: str, request: Request, file: UploadFile = File(...)) -> dict[str, object]:
+    _require_permission(request, "manage_chats")
+    if not file.filename or not file.filename.lower().endswith((".jsonl", ".json")):
+        raise HTTPException(status_code=400, detail="Only .jsonl or .json chat files are supported")
+    try:
+        card_data = character_cards_service.card_data(card_id)
+        char_name = str(card_data.get("name") or "Character")
+    except FileNotFoundError:
+        char_name = "Character"
+    try:
+        raw_text = (await file.read()).decode("utf-8-sig")
+        chat = bot_chats_service.import_sillytavern_chat(card_id, char_name, file.filename, raw_text)
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await _broadcast_chat(card_id, chat.id)
+    await _broadcast_notification(f"импортировал чат: {chat.title}", actor=_actor_from_request(request))
+    return {"chat": chat.model_dump(mode="json")}
 @app.post("/api/cards/{card_id}/chats/{chat_id}/messages")
 async def add_bot_chat_message(card_id: str, chat_id: str, request: ChatMessageCreate, http_request: Request) -> dict[str, object]:
     _require_permission(http_request, "edit_messages")
@@ -2045,7 +2260,8 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
                 message.model_copy(update={"content": RegexService.get_regexed_string(message.content, RegexService.PLACEMENT_AI_OUTPUT, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name)})
                 for message in history
             ]
-        lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden], card_id, chat_id, persona_id or "")
+        char_book = character_data.get("character_book") if isinstance(character_data.get("character_book"), dict) else None
+        lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden], card_id, chat_id, persona_id or "", character_book=char_book)
         if regex_scripts:
             lorebook_context = lorebook_context.model_copy(update={
                 "worldInfoBefore": RegexService.get_regexed_string(lorebook_context.worldInfoBefore, RegexService.PLACEMENT_WORLD_INFO, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name),
@@ -2058,14 +2274,18 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
                     for dp in lorebook_context.depthPrompts
                 ],
             })
+        world_info_payload = lorebook_context.model_dump(mode="json")
+        if request and request.extension_prompts:
+            world_info_payload["extensionPrompts"] = request.extension_prompts
+
         async def broadcast_stream(content: str) -> None:
             await _broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id)
 
         streaming_enabled = generation_service.should_stream_chat_reply(openai_preset)
         if streaming_enabled:
-            task = asyncio.create_task(generation_service.generate_chat_reply_stream(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, lorebook_context.model_dump(mode="json"), multi_user_mode, broadcast_stream))
+            task = asyncio.create_task(generation_service.generate_chat_reply_stream(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, world_info_payload, multi_user_mode, broadcast_stream))
         else:
-            task = asyncio.create_task(generation_service.generate_chat_reply(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, lorebook_context.model_dump(mode="json"), multi_user_mode))
+            task = asyncio.create_task(generation_service.generate_chat_reply(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, world_info_payload, multi_user_mode))
         generation_tasks[task_key] = task
         await _broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id, streaming=streaming_enabled)
         reply = await task
