@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,12 +24,12 @@ class BotChatMessage(BaseModel):
     is_admin: bool = False
     content: str
     display_text: str = ""
+    swipe_display_texts: dict[str, str] = Field(default_factory=dict)
     hidden: bool = False
     swipes: list[str] = Field(default_factory=list)
     active_swipe_index: int = 0
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
-
 
 class BotChat(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
@@ -259,13 +260,28 @@ class BotChatsService:
         chat = self.get_chat(card_id, chat_id)
         for message in chat.messages:
             if message.id == message_id:
+                swipe_key = str(max(0, message.active_swipe_index))
                 if request.content is not None:
                     content = request.content.strip()
                     if not content:
                         raise ValueError("Message content is required")
                     message.content = content
+                    if message.role == "assistant":
+                        if message.swipes and 0 <= message.active_swipe_index < len(message.swipes):
+                            message.swipes[message.active_swipe_index] = content
+                        else:
+                            message.swipes = [content]
+                            message.active_swipe_index = 0
+                    if request.display_text is None:
+                        message.display_text = ""
+                        message.swipe_display_texts.pop(swipe_key, None)
                 if request.display_text is not None:
-                    message.display_text = request.display_text.strip()
+                    cleaned_display = request.display_text.strip()
+                    message.display_text = cleaned_display
+                    if cleaned_display:
+                        message.swipe_display_texts[swipe_key] = cleaned_display
+                    else:
+                        message.swipe_display_texts.pop(swipe_key, None)
                 if request.hidden is not None:
                     message.hidden = request.hidden
                 message.updated_at = utc_now()
@@ -324,6 +340,9 @@ class BotChatsService:
                 swipes = [content] if reset_swipes else [*(message.swipes or [message.content]), content]
                 message.swipes = swipes
                 message.active_swipe_index = len(swipes) - 1
+                if reset_swipes:
+                    message.swipe_display_texts = {}
+                message.display_text = ""
                 message.author = author.strip() or message.author
                 message.avatar_url = avatar_url.strip() or message.avatar_url
                 message.content = content
@@ -343,6 +362,7 @@ class BotChatsService:
                 message.swipes = swipes
                 message.active_swipe_index = (message.active_swipe_index + (1 if direction >= 0 else -1)) % len(swipes)
                 message.content = swipes[message.active_swipe_index]
+                message.display_text = message.swipe_display_texts.get(str(message.active_swipe_index), "")
                 message.updated_at = utc_now()
                 chat.updated_at = utc_now()
                 self._save(chat)
@@ -382,7 +402,9 @@ class BotChatsService:
         directory = self._card_chat_dir(chat.card_id)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{chat.id}.json"
-        path.write_text(json.dumps(chat.model_dump(mode="json"), ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path = directory / f".{chat.id}.{uuid4().hex[:8]}.tmp"
+        tmp_path.write_text(json.dumps(chat.model_dump(mode="json"), ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
         st = path.stat()
         self._summary_cache[path] = (
             st.st_mtime_ns,

@@ -227,6 +227,8 @@ type RealtimePayload = {
   card_id?: string;
   chat_id?: string;
   chat?: BotChat;
+  switch_active?: boolean;
+  active_generations?: string[];
   session?: { participants?: Record<string, Participant>; active_card_id?: string; active_chat_id?: string };
   message?: string;
   message_id?: string;
@@ -691,7 +693,13 @@ export default function App() {
   const [playersMenuOpen, setPlayersMenuOpen] = useState(false);
   const [extensionSettingsOpen, setExtensionSettingsOpen] = useState(false);
   const [extensionSettingsTarget, setExtensionSettingsTarget] = useState('');
-  const [mobileTopbarCollapsed, setMobileTopbarCollapsed] = useState(false);
+  const [mobileTopbarCollapsed, setMobileTopbarCollapsed] = useState(() => typeof window !== 'undefined' && window.innerWidth <= 640);
+  const [showScrollBottomButton, setShowScrollBottomButton] = useState(false);
+  const [regexRenderTick, setRegexRenderTick] = useState(0);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const isNearBottomRef = useRef(true);
+  const lastScrolledChatIdRef = useRef('');
+  const lastMessageCountRef = useRef(0);
   const [selectedPersonaId, setSelectedPersonaId] = useState(() => window.localStorage.getItem(SELECTED_PERSONA_STORAGE_KEY) || '');
   const [generationSettings, setGenerationSettings] = useState<GenerationSettings>(defaultGenerationSettings);
   const [models, setModels] = useState<string[]>([]);
@@ -930,7 +938,23 @@ export default function App() {
     }
   }, [accessToken, accessPasswordRequired]);
 
-  const updateTopbarForScroll = (currentY: number) => {
+  const scrollToChatBottom = (behavior: ScrollBehavior = 'auto') => {
+    const el = chatScrollRef.current;
+    if (!el) {
+      return;
+    }
+    el.scrollTo({ top: el.scrollHeight, behavior });
+    isNearBottomRef.current = true;
+    setShowScrollBottomButton(false);
+  };
+
+  const updateTopbarForScroll = (currentY: number, scrollEl?: HTMLDivElement | null) => {
+    if (scrollEl) {
+      const distanceFromBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+      const nearBottom = distanceFromBottom < 180;
+      isNearBottomRef.current = nearBottom;
+      setShowScrollBottomButton(!nearBottom && scrollEl.scrollHeight - scrollEl.clientHeight > 240);
+    }
     if (window.matchMedia('(max-width: 900px)').matches) {
       setTopbarVisible(true);
       topbarScrollYRef.current = currentY;
@@ -949,8 +973,13 @@ export default function App() {
 
   useEffect(() => {
     const onScroll = () => updateTopbarForScroll(window.scrollY);
+    const onRegexUpdated = () => setRegexRenderTick((tick) => tick + 1);
     window.addEventListener('scroll', onScroll, { passive: true });
-    return () => window.removeEventListener('scroll', onScroll);
+    window.addEventListener('doubletrouble:regex-updated', onRegexUpdated);
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('doubletrouble:regex-updated', onRegexUpdated);
+    };
   }, []);
 
   useEffect(() => {
@@ -1035,6 +1064,28 @@ export default function App() {
   }, [authChecked, accessPasswordRequired, accessUnlocked, authRequired, authUser]);
 
   useEffect(() => {
+    const chatId = activeChat?.id || '';
+    const msgCount = activeMessages.length;
+    if (chatId && lastScrolledChatIdRef.current !== chatId) {
+      lastScrolledChatIdRef.current = chatId;
+      lastMessageCountRef.current = msgCount;
+      isNearBottomRef.current = true;
+      window.requestAnimationFrame(() => scrollToChatBottom('auto'));
+    } else if (msgCount > lastMessageCountRef.current && isNearBottomRef.current) {
+      lastMessageCountRef.current = msgCount;
+      window.requestAnimationFrame(() => scrollToChatBottom('smooth'));
+    } else {
+      lastMessageCountRef.current = msgCount;
+    }
+  }, [activeChat?.id, activeMessages.length]);
+
+  useEffect(() => {
+    if ((isGenerating || generationStreamText) && isNearBottomRef.current) {
+      window.requestAnimationFrame(() => scrollToChatBottom('auto'));
+    }
+  }, [isGenerating, generationStreamText]);
+
+  useEffect(() => {
     renderedExtensionMessageSignaturesRef.current = new Map(activeMessages.map((message) => [message.id, extensionMessageSignature(message)]));
     const timer = window.setTimeout(() => { void emitSillyTavernChatChanged(); }, 80);
     return () => window.clearTimeout(timer);
@@ -1058,6 +1109,16 @@ export default function App() {
     let disposed = false;
     let reconnectTimer: number | undefined;
     let pingInterval: number | undefined;
+    let hasConnectedOnce = false;
+
+    const syncAfterReconnect = () => {
+      void refreshLibrary();
+      const card = activeCardRef.current;
+      const chat = activeChatRef.current;
+      if (card && chat) {
+        void openChatForCard(card, chat.id);
+      }
+    };
 
     const connect = () => {
       if (disposed) {
@@ -1071,6 +1132,8 @@ export default function App() {
       const socket = new WebSocket(`${protocol}//${window.location.host}/ws/sessions/default${qs ? `?${qs}` : ''}`);
       websocketRef.current = socket;
       socket.onopen = () => {
+        const isReconnect = hasConnectedOnce;
+        hasConnectedOnce = true;
         const currentPersona = personasRef.current.find((p) => p.id === selectedPersonaIdRef.current) || personasRef.current[0] || null;
         sendPresence(currentPersona);
         while (pendingRealtimeEventsRef.current.length) {
@@ -1078,6 +1141,9 @@ export default function App() {
           if (ev) {
             sendRealtimeEvent(ev);
           }
+        }
+        if (isReconnect) {
+          syncAfterReconnect();
         }
         window.clearInterval(pingInterval);
         pingInterval = window.setInterval(() => {
@@ -1092,8 +1158,12 @@ export default function App() {
           return;
         }
         if (payload.type === 'chat.updated' && payload.chat) {
-          if (activeChatRef.current?.id === payload.chat.id || (!activeChatRef.current && payload.card_id && activeCardRef.current?.id === payload.card_id)) {
+          const sameCard = Boolean(payload.card_id && activeCardRef.current?.id === payload.card_id);
+          if (activeChatRef.current?.id === payload.chat.id || (sameCard && (!activeChatRef.current || payload.switch_active))) {
             setActiveChat(payload.chat);
+            if (payload.card_id) {
+              rememberChatSelection(payload.card_id, payload.chat.id);
+            }
             setImagePendingMessages((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${payload.card_id || payload.chat?.card_id || ''}:${payload.chat?.id || ''}:`))));
             document.querySelectorAll('#chat .iig-local-pending').forEach((element) => element.classList.remove('iig-local-pending'));
           } else if (!activeCardRef.current && payload.card_id) {
@@ -1104,7 +1174,7 @@ export default function App() {
               rememberChatSelection(targetCard.id, payload.chat.id);
             }
           }
-          if (payload.card_id && activeCardRef.current?.id === payload.card_id) {
+          if (sameCard && payload.card_id) {
             void refreshCardChats(payload.card_id);
           }
         }
@@ -1133,6 +1203,19 @@ export default function App() {
         }
         if (payload.type === 'chat.deleted' && payload.chat_id === activeChatRef.current?.id) {
           setActiveChat(null);
+          const currentCard = activeCardRef.current;
+          if (currentCard) {
+            void (async () => {
+              const r = await authedFetch(`/api/cards/${encodeURIComponent(currentCard.id)}/chats`);
+              if (r.ok) {
+                const d = await r.json() as { chats: BotChatSummary[] };
+                setBotChats(d.chats);
+                if (d.chats[0]) {
+                  await openChatForCard(currentCard, d.chats[0].id);
+                }
+              }
+            })();
+          }
         }
         if (payload.type === 'card.deleted' && payload.card_id) {
           setCards((current) => current.filter((card) => card.id !== payload.card_id));
@@ -1144,6 +1227,14 @@ export default function App() {
         }
         if ((payload.type === 'presence.updated' || payload.type === 'session.snapshot' || payload.type === 'session.updated') && payload.session?.participants) {
           sessionSnapshotReceivedRef.current = true;
+          if (Array.isArray(payload.active_generations) && activeCardRef.current && activeChatRef.current) {
+            const activeKey = `${activeCardRef.current.id}:${activeChatRef.current.id}`;
+            if (payload.active_generations.includes(activeKey)) {
+              activeGenerationRef.current = true;
+              setIsGenerating(true);
+              setGenerationStatus(`${activeCardRef.current.name || t('composer.bot')} ${t('composer.typing')}`);
+            }
+          }
           if (payload.session.active_card_id) {
             sessionActiveTargetRef.current = { cardId: payload.session.active_card_id, chatId: payload.session.active_chat_id || '' };
             if (!activeCardRef.current && cardsRef.current.length) {
@@ -1226,10 +1317,23 @@ export default function App() {
         }
       };
     };
-
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible' || disposed) {
+        return;
+      }
+      const ws = websocketRef.current;
+      if (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING)) {
+        window.clearTimeout(reconnectTimer);
+        connect();
+      } else {
+        syncAfterReconnect();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     connect();
     return () => {
       disposed = true;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       window.clearTimeout(reconnectTimer);
       window.clearInterval(pingInterval);
       websocketRef.current?.close();
@@ -2577,7 +2681,16 @@ export default function App() {
     const opened = await openChatForCard(activeCard, chatId);
     if (!opened) {
       setLibraryMessage(t('chat.error.open'));
+      return;
     }
+    sendRealtimeEvent({
+      type: 'card.select',
+      card_id: activeCard.id,
+      chat_id: chatId,
+      participant_id: participantIdRef.current,
+      name: activeCard.name,
+      persona_name: selectedPersona?.name || 'Player',
+    });
   };
 
   const copyChat = async (chatId: string) => {
@@ -2614,6 +2727,29 @@ export default function App() {
     link.remove();
     window.URL.revokeObjectURL(url);
     setLibraryMessage(t('chat.exportedST'));
+  };
+
+  const importBotChat = async (file: File | null) => {
+    if (!file || !activeCard) {
+      return;
+    }
+    const body = new FormData();
+    body.append('file', file);
+    const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/import`, {
+      method: 'POST',
+      headers: actorHeaders(),
+      body,
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => null) as { detail?: string } | null;
+      setLibraryMessage(error?.detail || t('chat.error.open'));
+      return;
+    }
+    const data = await response.json() as { chat: BotChat };
+    setActiveChat(data.chat);
+    rememberChatSelection(activeCard.id, data.chat.id);
+    await refreshCardChats(activeCard.id);
+    setChatPickerOpen(false);
   };
 
   const toggleDeletionLock = async (category: keyof DeletionLocks, itemId: string) => {
@@ -3302,12 +3438,20 @@ export default function App() {
             <small>default session · {window.location.host}</small>
           </div>
           <img className="brand-mark" src="/favicon.png" alt="DT" />
+          <button
+            className="ghost-button topbar-collapse-button"
+            type="button"
+            aria-label={mobileTopbarCollapsed ? 'Развернуть панель' : 'Свернуть панель'}
+            onClick={() => setMobileTopbarCollapsed((collapsed) => !collapsed)}
+          >
+            {mobileTopbarCollapsed ? '▾' : '▴'}
+          </button>
         </div>
       </header>
 
       <section className="hybrid-layout">
         <section className="chat-stage">
-          <div className="chat-scroll" id="chat" onScroll={(event) => updateTopbarForScroll(event.currentTarget.scrollTop)}>
+          <div className="chat-scroll" id="chat" ref={chatScrollRef} onScroll={(event) => updateTopbarForScroll(event.currentTarget.scrollTop, event.currentTarget)}>
             {accessDenied.chats ? <AccessDeniedNotice /> : activeMessages.length ? activeMessages.map((message, messageIndex) => {
               const isOwnMessage = message.role === 'user' && (message.participant_id ? message.participant_id === participantIdRef.current : message.author === selectedPersona?.name);
               const messageClass = `mes ${message.role === 'assistant' ? 'message bot-message' : 'message'}${message.hidden ? ' hidden-message' : ''}${isOwnMessage ? ' own-message' : ''}`;
@@ -3381,7 +3525,7 @@ export default function App() {
                         <button type="button" title={t('common.cancel')} onClick={() => { setEditingMessageId(''); setEditingMessageText(''); }}><Icon name="x" /></button>
                       </div>
                     </div>
-                  ) : <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}`} content={visibleMessageContent} reasoning={reasoningDisplay} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />}
+                  ) : <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}:${regexRenderTick}`} content={visibleMessageContent} reasoning={reasoningDisplay} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />}
                 </div>
               </article>
               );
@@ -3400,6 +3544,16 @@ export default function App() {
               </article>
             ) : null}
           </div>
+          {showScrollBottomButton ? (
+            <button
+              className="scroll-bottom-button"
+              type="button"
+              aria-label="Прокрутить вниз"
+              onClick={() => scrollToChatBottom('smooth')}
+            >
+              ↓
+            </button>
+          ) : null}
 
           <form id="send_form" className="composer" onSubmit={(event) => { event.preventDefault(); void sendChatMessage(); }}>
             <button className="composer-menu-button" type="button" aria-label={t('composer.actions')} onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
@@ -3416,6 +3570,7 @@ export default function App() {
                 activeChat={activeChat}
                 botChats={botChats}
                 createBotChat={createBotChat}
+                importChat={importBotChat}
                 copyChat={copyChat}
                 exportChat={exportChat}
                 deleteChat={deleteChat}
@@ -6321,6 +6476,7 @@ function ChatPicker({
   activeChat,
   botChats,
   createBotChat,
+  importChat,
   copyChat,
   exportChat,
   deleteChat,
@@ -6339,6 +6495,7 @@ function ChatPicker({
   activeChat: BotChat | null;
   botChats: BotChatSummary[];
   createBotChat: () => Promise<void>;
+  importChat?: (file: File | null) => Promise<void>;
   copyChat: (chatId: string) => Promise<void>;
   exportChat: (chatId: string) => Promise<void>;
   deleteChat: (chatId: string) => Promise<void>;
@@ -6361,6 +6518,21 @@ function ChatPicker({
         <strong>{t('chat.cardChats')}</strong>
         <div className="chat-picker-header-actions">
           <button type="button" onClick={() => void createBotChat()}>{t('common.new')}</button>
+          {importChat ? (
+            <label className="ghost-button" style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', padding: '0.45rem 0.55rem', fontSize: '0.84rem' }}>
+              <span>+ .jsonl</span>
+              <input
+                type="file"
+                accept=".jsonl,.json,application/jsonl,application/json"
+                style={{ display: 'none' }}
+                onChange={(event) => {
+                  const file = event.target.files?.[0] || null;
+                  event.target.value = '';
+                  void importChat(file);
+                }}
+              />
+            </label>
+          ) : null}
           <button className="ghost-button" type="button" onClick={close}>{t('common.close')}</button>
         </div>
       </header>
@@ -6862,8 +7034,9 @@ function csvToArray(value: string): string[] {
 }
 
 function lorebookEntriesFromBook(book: RawPreset): RawPreset[] {
-  const entries = isObjectRecord(book.entries) ? book.entries : {};
-  return Object.values(entries)
+  const raw = book.entries;
+  const list = Array.isArray(raw) ? raw : isObjectRecord(raw) ? Object.values(raw) : [];
+  return list
     .filter(isObjectRecord)
     .sort((left, right) => numberField(left.displayIndex, numberField(left.uid, 0)) - numberField(right.displayIndex, numberField(right.uid, 0)));
 }

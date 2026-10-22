@@ -1,8 +1,7 @@
 from __future__ import annotations
-
+import os
 from pathlib import Path
 from uuid import uuid4
-
 from pydantic import BaseModel, Field
 import yaml
 
@@ -92,12 +91,20 @@ class PersonasService:
         personas = self._load()
         selected: Persona | None = None
         self.avatars_dir.mkdir(parents=True, exist_ok=True)
+        for old_file in self.avatars_dir.glob(f"{persona_id}.*"):
+            if old_file.suffix.lower() != suffix:
+                try:
+                    old_file.unlink()
+                except OSError:
+                    pass
         avatar_filename = f"{persona_id}{suffix}"
-        (self.avatars_dir / avatar_filename).write_bytes(content)
+        avatar_path = self.avatars_dir / avatar_filename
+        avatar_path.write_bytes(content)
+        mtime = int(avatar_path.stat().st_mtime)
         for persona in personas:
             if persona.id == persona_id:
                 persona.avatar = avatar_filename
-                persona.avatar_url = f"/api/personas/avatars/{avatar_filename}"
+                persona.avatar_url = f"/api/personas/avatars/{avatar_filename}?v={mtime}"
                 selected = persona
                 break
         if selected is None:
@@ -119,11 +126,16 @@ class PersonasService:
             raw = yaml.safe_load(personas_file) or []
         personas = [Persona.model_validate(item) for item in raw if isinstance(item, dict)]
         for persona in personas:
-            if persona.avatar and not persona.avatar_url:
-                persona.avatar_url = f"/api/personas/avatars/{persona.avatar}"
+            if persona.avatar:
+                avatar_file = self.avatars_dir / Path(persona.avatar).name
+                mtime = int(avatar_file.stat().st_mtime) if avatar_file.exists() else 0
+                base_url = f"/api/personas/avatars/{Path(persona.avatar).name}"
+                persona.avatar_url = f"{base_url}?v={mtime}" if mtime else base_url
         return personas
 
     def _save(self, personas: list[Persona]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as personas_file:
+        tmp_path = self.path.with_suffix(".yaml.tmp")
+        with tmp_path.open("w", encoding="utf-8") as personas_file:
             yaml.safe_dump([persona.model_dump(mode="json") for persona in personas], personas_file, sort_keys=False, allow_unicode=True)
+        os.replace(tmp_path, self.path)

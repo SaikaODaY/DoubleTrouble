@@ -128,10 +128,13 @@ class SessionService:
             session.active_card_id = card_id
         if chat_id:
             session.active_chat_id = chat_id
+        elif not card_id:
+            session.active_chat_id = ""
 
     def snapshot(self, session_id: str) -> dict[str, object]:
         session = self.get_or_create_session(session_id)
         return session.model_dump(mode="json")
+
     def _advance_turn(self, session: Session, participant_id: str) -> None:
         if not session.turn.order:
             session.turn.current_participant_id = participant_id

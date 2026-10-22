@@ -266,8 +266,9 @@ export function RegexSettings() {
 
   useEffect(() => {
     refresh();
+    window.addEventListener('doubletrouble:regex-updated', refresh);
+    return () => window.removeEventListener('doubletrouble:regex-updated', refresh);
   }, [refresh]);
-
   const save = (type: ScriptType, scripts: RegexScript[]) => {
     saveScriptsByType(scripts, type);
     refresh();

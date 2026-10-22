@@ -149,14 +149,13 @@ class MagicTranslationRequest(BaseModel):
     source_settings: dict[str, Any] = Field(default_factory=dict)
 
 
-async def _broadcast_chat(card_id: str, chat_id: str) -> None:
+async def _broadcast_chat(card_id: str, chat_id: str, switch_active: bool = False) -> None:
     session_service.set_active_chat(DEFAULT_SESSION_ID, card_id, chat_id)
     chat = bot_chats_service.get_chat(card_id, chat_id)
     await connection_manager.broadcast(
         DEFAULT_SESSION_ID,
-        {"type": "chat.updated", "card_id": card_id, "chat": chat.model_dump(mode="json")},
+        {"type": "chat.updated", "card_id": card_id, "chat": chat.model_dump(mode="json"), "switch_active": switch_active},
     )
-
 def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     chat = bot_chats_service.get_chat(card_id, chat_id)
     character_data = character_cards_service.card_data(card_id)
@@ -1977,6 +1976,16 @@ async def import_character_card(request: Request, file: UploadFile = File(...)) 
         ext_data = card_data.get("extensions")
         if isinstance(ext_data, dict) and isinstance(ext_data.get("regex_scripts"), list):
             imported_regex_scripts = [item for item in ext_data["regex_scripts"] if isinstance(item, dict)]
+            if imported_regex_scripts:
+                ext_settings = extensions_service.get_settings()
+                regex_store = ext_settings.get("__dt_regex_store") if isinstance(ext_settings.get("__dt_regex_store"), dict) else {}
+                scoped_map = dict(regex_store.get("scoped")) if isinstance(regex_store.get("scoped"), dict) else {}
+                scoped_map[card.id] = imported_regex_scripts
+                allowed_list = list(regex_store.get("scopedAllowed")) if isinstance(regex_store.get("scopedAllowed"), list) else []
+                if card.id not in allowed_list:
+                    allowed_list.append(card.id)
+                extensions_service.save_settings({"__dt_regex_store": {**regex_store, "scoped": scoped_map, "scopedAllowed": allowed_list}}, merge=True)
+                await _broadcast_shared_settings("extension_settings")
     except Exception:
         pass
     await _broadcast_shared_settings("cards")
@@ -2092,7 +2101,7 @@ async def create_bot_chat(card_id: str, request: ChatCreate, http_request: Reque
     _require_permission(http_request, "manage_chats")
     chat = bot_chats_service.create_chat(card_id, request)
     chat = _ensure_card_first_message(card_id, chat.id)
-    await _broadcast_chat(card_id, chat.id)
+    await _broadcast_chat(card_id, chat.id, switch_active=True)
     return {"chat": chat.model_dump(mode="json")}
 
 
@@ -2124,7 +2133,7 @@ async def copy_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[st
         chat = bot_chats_service.copy_chat(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
-    await _broadcast_chat(card_id, chat.id)
+    await _broadcast_chat(card_id, chat.id, switch_active=True)
     return {"chat": chat.model_dump(mode="json")}
 
 
@@ -2172,7 +2181,7 @@ async def import_bot_chat_sillytavern(card_id: str, request: Request, file: Uplo
         chat = bot_chats_service.import_sillytavern_chat(card_id, char_name, file.filename, raw_text)
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    await _broadcast_chat(card_id, chat.id)
+    await _broadcast_chat(card_id, chat.id, switch_active=True)
     await _broadcast_notification(f"импортировал чат: {chat.title}", actor=_actor_from_request(request))
     return {"chat": chat.model_dump(mode="json")}
 @app.post("/api/cards/{card_id}/chats/{chat_id}/messages")
@@ -2489,10 +2498,17 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
         return
     participant_id: str | None = None
     try:
-        await websocket.send_json({"type": "session.snapshot", "session": session_service.snapshot(session_id)})
+        await websocket.send_json({
+            "type": "session.snapshot",
+            "session": session_service.snapshot(session_id),
+            "active_generations": [key for key, task in generation_tasks.items() if not task.done()],
+        })
         while True:
             raw_event = await websocket.receive_json()
-            event = ClientEvent.model_validate(raw_event)
+            try:
+                event = ClientEvent.model_validate(raw_event)
+            except Exception:
+                continue
 
             if event.type == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -2510,6 +2526,7 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                     bool(event.is_admin),
                 )
                 participant_id = participant.id
+                connection_manager.bind_participant(session_id, websocket, participant.id)
                 await _broadcast_presence(session_id)
 
             if event.type == "presence.update" and event.participant_id:
@@ -2524,6 +2541,7 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                     bool(event.is_admin),
                 )
                 participant_id = participant.id
+                connection_manager.bind_participant(session_id, websocket, participant.id)
                 await _broadcast_presence(session_id)
 
             if event.type == "card.select" and event.name:
@@ -2565,13 +2583,13 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                     session_id,
                     {"type": "session.updated", "session": session_service.snapshot(session_id), "message": message.model_dump(mode="json")},
                 )
-    except WebSocketDisconnect:
-        if participant_id:
-            session_service.disconnect_participant(session_id, participant_id)
-            await _broadcast_presence(session_id)
+    except (WebSocketDisconnect, Exception):
+        pass
     finally:
-        connection_manager.disconnect(session_id, websocket)
-
+        bound_pid = connection_manager.disconnect(session_id, websocket) or participant_id
+        if bound_pid and not connection_manager.has_other_connections(session_id, bound_pid, websocket):
+            session_service.disconnect_participant(session_id, bound_pid)
+            await _broadcast_presence(session_id)
 
 frontend_dist = PROJECT_ROOT / "frontend" / "dist"
 if frontend_dist.exists():

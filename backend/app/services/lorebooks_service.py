@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 from pathlib import Path
@@ -84,22 +85,54 @@ class LorebooksService:
             raise FileNotFoundError(name)
         return self._read_cached_book(path)
 
+    def _normalize_saved_entry(self, idx: int, item: dict[str, Any]) -> dict[str, Any]:
+        entry = dict(item)
+        entry.setdefault("uid", entry.get("id", idx))
+        entry.setdefault("displayIndex", idx)
+        if "key" not in entry and isinstance(entry.get("keys"), list):
+            entry["key"] = entry["keys"]
+        if "keysecondary" not in entry and isinstance(entry.get("secondary_keys"), list):
+            entry["keysecondary"] = entry["secondary_keys"]
+        if "comment" not in entry and entry.get("name"):
+            entry["comment"] = str(entry["name"])
+        if "disable" not in entry and "enabled" in entry:
+            entry["disable"] = not bool(entry["enabled"])
+        if "order" not in entry and "insertion_order" in entry:
+            entry["order"] = entry["insertion_order"]
+        pos = entry.get("position")
+        if pos == "before_char":
+            entry["position"] = 0
+        elif pos == "after_char":
+            entry["position"] = 1
+        return entry
+
     def save_book(self, payload: LorebookPayload) -> LorebookSummary:
         name = self._safe_name(payload.name)
         if not name:
             raise ValueError("Lorebook name is required")
-        book = payload.book if isinstance(payload.book, dict) else {"entries": {}}
+        book = dict(payload.book) if isinstance(payload.book, dict) else {"entries": {}}
         raw_entries = book.get("entries")
         if isinstance(raw_entries, list):
-            book["entries"] = {str(idx): item for idx, item in enumerate(raw_entries) if isinstance(item, dict)}
-        elif not isinstance(raw_entries, dict):
+            book["entries"] = {
+                str(idx): self._normalize_saved_entry(idx, item)
+                for idx, item in enumerate(raw_entries)
+                if isinstance(item, dict)
+            }
+        elif isinstance(raw_entries, dict):
+            book["entries"] = {
+                str(k): self._normalize_saved_entry(idx, item)
+                for idx, (k, item) in enumerate(raw_entries.items())
+                if isinstance(item, dict)
+            }
+        else:
             book["entries"] = {}
         self.worlds_dir.mkdir(parents=True, exist_ok=True)
         path = self.worlds_dir / f"{name}.json"
-        path.write_text(json.dumps(book, ensure_ascii=False, indent=4), encoding="utf-8")
+        tmp_path = self.worlds_dir / f".{name}.json.tmp"
+        tmp_path.write_text(json.dumps(book, ensure_ascii=False, indent=4), encoding="utf-8")
+        os.replace(tmp_path, path)
         self._cache.pop(path, None)
         return next(summary for summary in self.list_books() if summary.name == name)
-
     def import_book(self, filename: str, content: bytes) -> LorebookSummary:
         if not filename.lower().endswith(".json"):
             raise ValueError("Only JSON lorebooks are supported")
@@ -122,9 +155,10 @@ class LorebooksService:
     def save_bindings(self, bindings: list[LorebookBinding]) -> list[LorebookBinding]:
         cleaned = [binding for binding in bindings if binding.book and binding.target_type in {"global", "card", "chat", "persona"}]
         self.bindings_path.parent.mkdir(parents=True, exist_ok=True)
-        self.bindings_path.write_text(yaml.safe_dump([binding.model_dump(mode="json") for binding in cleaned], sort_keys=False, allow_unicode=True), encoding="utf-8")
+        tmp_path = self.bindings_path.with_suffix(".yaml.tmp")
+        tmp_path.write_text(yaml.safe_dump([binding.model_dump(mode="json") for binding in cleaned], sort_keys=False, allow_unicode=True), encoding="utf-8")
+        os.replace(tmp_path, self.bindings_path)
         return cleaned
-
     def _extract_entries(self, book: dict[str, Any] | None) -> list[dict[str, Any]]:
         if not isinstance(book, dict):
             return []

@@ -126,10 +126,92 @@ function loadArray<T>(key: string): T[] {
   }
 }
 
-function saveArray(key: string, value: unknown[]) {
-  window.localStorage.setItem(key, JSON.stringify(value));
+let suppressServerPush = false;
+let pushRegexTimer: number | undefined;
+
+function collectRegexStoreSnapshot(): Record<string, unknown> {
+  const scoped: Record<string, unknown> = {};
+  const preset: Record<string, unknown> = {};
+  for (let i = 0; i < window.localStorage.length; i++) {
+    const k = window.localStorage.key(i);
+    if (!k) continue;
+    if (k.startsWith(SCOPED_PREFIX)) {
+      scoped[k.slice(SCOPED_PREFIX.length)] = loadArray(k);
+    } else if (k.startsWith(PRESET_PREFIX)) {
+      preset[k.slice(PRESET_PREFIX.length)] = loadArray(k);
+    }
+  }
+  return {
+    global: loadArray(GLOBAL_KEY),
+    scoped,
+    preset,
+    scopedAllowed: loadArray(SCOPED_ALLOWED_KEY),
+    presetAllowed: loadRaw(PRESET_ALLOWED_KEY) || {},
+    presets: loadArray(PRESETS_KEY),
+  };
 }
 
+function scheduleRegexServerPush() {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent('doubletrouble:regex-updated'));
+  if (suppressServerPush) return;
+  window.clearTimeout(pushRegexTimer);
+  pushRegexTimer = window.setTimeout(() => {
+    const token = window.localStorage.getItem('doubletrouble.authToken') || '';
+    const access = window.localStorage.getItem('doubletrouble.accessToken') || '';
+    void fetch('/api/extensions/settings', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(access ? { 'X-DoubleTrouble-Access': access } : {}),
+      },
+      body: JSON.stringify({ extension_settings: { __dt_regex_store: collectRegexStoreSnapshot() }, merge: true }),
+    }).catch(() => undefined);
+  }, 250);
+}
+
+export function hydrateRegexStoreFromServer(rawStore: unknown) {
+  if (!rawStore || typeof rawStore !== 'object' || Array.isArray(rawStore)) return;
+  const store = rawStore as Record<string, unknown>;
+  suppressServerPush = true;
+  try {
+    if (Array.isArray(store.global)) {
+      window.localStorage.setItem(GLOBAL_KEY, JSON.stringify(store.global));
+    }
+    if (store.scoped && typeof store.scoped === 'object' && !Array.isArray(store.scoped)) {
+      for (const [cardId, list] of Object.entries(store.scoped as Record<string, unknown>)) {
+        if (Array.isArray(list)) {
+          window.localStorage.setItem(`${SCOPED_PREFIX}${cardId}`, JSON.stringify(list));
+        }
+      }
+    }
+    if (store.preset && typeof store.preset === 'object' && !Array.isArray(store.preset)) {
+      for (const [presetName, list] of Object.entries(store.preset as Record<string, unknown>)) {
+        if (Array.isArray(list)) {
+          window.localStorage.setItem(`${PRESET_PREFIX}${presetName}`, JSON.stringify(list));
+        }
+      }
+    }
+    if (Array.isArray(store.scopedAllowed)) {
+      window.localStorage.setItem(SCOPED_ALLOWED_KEY, JSON.stringify(store.scopedAllowed));
+    }
+    if (store.presetAllowed && typeof store.presetAllowed === 'object') {
+      window.localStorage.setItem(PRESET_ALLOWED_KEY, JSON.stringify(store.presetAllowed));
+    }
+    if (Array.isArray(store.presets)) {
+      window.localStorage.setItem(PRESETS_KEY, JSON.stringify(store.presets));
+    }
+  } finally {
+    suppressServerPush = false;
+  }
+  window.dispatchEvent(new CustomEvent('doubletrouble:regex-updated'));
+}
+
+function saveArray(key: string, value: unknown[]) {
+  window.localStorage.setItem(key, JSON.stringify(value));
+  scheduleRegexServerPush();
+}
 export function getScriptsByType(scriptType: ScriptType | typeof SCRIPT_TYPE_UNKNOWN): RegexScript[] {
   if (scriptType === SCRIPT_TYPE_UNKNOWN) return [];
   switch (scriptType) {
@@ -296,6 +378,7 @@ function loadRaw(key: string): unknown {
 
 function saveRaw(key: string, value: unknown) {
   window.localStorage.setItem(key, JSON.stringify(value));
+  scheduleRegexServerPush();
 }
 
 export function regexFromString(str: string): RegExp {

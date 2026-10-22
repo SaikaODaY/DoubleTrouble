@@ -1,3 +1,5 @@
+import { hydrateRegexStoreFromServer } from './regexEngine';
+
 type ExtensionManifest = {
   display_name?: string;
   loading_order?: number | string;
@@ -1331,10 +1333,13 @@ function loadScript(name: string, manifest: ExtensionManifest) {
 export async function syncServerExtensionSettings() {
   const data = await loadJson<{ extension_settings?: Record<string, unknown> }>('/api/extensions/settings');
   if (data?.extension_settings && typeof data.extension_settings === 'object') {
+    if (data.extension_settings.__dt_regex_store) {
+      hydrateRegexStoreFromServer(data.extension_settings.__dt_regex_store);
+    }
     Object.entries(data.extension_settings).forEach(([key, value]) => {
       if (value && typeof value === 'object' && !Array.isArray(value) && extensionSettings[key] && typeof extensionSettings[key] === 'object') {
         extensionSettings[key] = { ...(extensionSettings[key] as Record<string, unknown>), ...(value as Record<string, unknown>) };
-      } else if (extensionSettings[key] === undefined) {
+      } else {
         extensionSettings[key] = value;
       }
     });

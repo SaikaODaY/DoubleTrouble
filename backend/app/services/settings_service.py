@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import secrets
 from pathlib import Path
 from typing import Any
@@ -393,9 +394,10 @@ class SettingsService:
 
     def _save_settings(self) -> None:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.settings_path.open("w", encoding="utf-8") as settings_file:
+        tmp_path = self.settings_path.with_suffix(".yaml.tmp")
+        with tmp_path.open("w", encoding="utf-8") as settings_file:
             yaml.safe_dump(self.settings.model_dump(mode="json"), settings_file, sort_keys=False, allow_unicode=True)
-
+        os.replace(tmp_path, self.settings_path)
     @staticmethod
     def _hash_access_password(password: str, salt: str) -> str:
         return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("ascii"), 120_000).hex()
