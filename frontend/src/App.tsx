@@ -12,7 +12,7 @@ type IconName = 'sliders' | 'plug' | 'palette' | 'user' | 'card' | 'book' | 'bot
 type ThemeId = 'midnight' | 'parchment' | 'abyss' | 'forest' | 'ocean' | 'plum' | 'ember' | 'aurora' | 'rose' | 'slate' | 'noir' | 'cyberpunk' | 'dracula' | 'nord' | 'coffee' | 'porcelain' | 'mint' | 'lavender' | 'solar' | 'sand' | 'linen' | 'cloud' | 'buttercream' | 'seashell' | 'morning' | 'paper';
 type VisualSettings = {
   theme: ThemeId;
-  textScale: 'small' | 'normal' | 'large' | 'huge';
+  textScale: 'tiny' | 'small' | 'normal' | 'large' | 'huge';
   density: 'compact' | 'comfortable' | 'spacious';
   messageWidth: 'narrow' | 'standard' | 'wide';
   radius: 'sharp' | 'soft' | 'round';
@@ -3891,31 +3891,6 @@ export default function App() {
       data-topbar-visible={String(topbarVisible)}
     >
       <header className="topbar">
-        <div className="topbar-left">
-          <button
-            type="button"
-            className="topbar-chat-pill"
-            onClick={() => {
-              if (activeCard) {
-                setChatPickerOpen((open) => !open);
-              } else {
-                setActiveSection('cards');
-                setMenuOpen(true);
-              }
-            }}
-            title="Сменить чат или карточку персонажа"
-          >
-            {activeCard?.image_url ? (
-              <img src={imageSrc(activeCard.image_url)} alt="" className="topbar-mini-avatar" />
-            ) : (
-              <i className="topbar-mini-avatar">{activeCard?.name?.slice(0, 1) || '✦'}</i>
-            )}
-            <strong>{activeCard?.name || t('topbar.activeChat.noCard')}</strong>
-            <span className="topbar-sep">/</span>
-            <small>{activeChat?.title || t('topbar.activeChat.noChat')}</small>
-          </button>
-        </div>
-
         <nav className="topbar-quick-nav" aria-label={t('topbar.menu')}>
           {getMenuItems(t).map((item) => {
             const isActive = menuOpen && activeSection === item.id;
@@ -3943,22 +3918,12 @@ export default function App() {
         </nav>
 
         <div className="topbar-right">
-          <button
-            type="button"
-            className="topbar-persona-pill"
-            onClick={() => {
-              setActiveSection('personas');
-              setMenuOpen(true);
-            }}
-            title={t('topbar.persona')}
-          >
-            <Icon name="user" />
-            <span>{selectedPersona?.name || t('topbar.persona.none')}</span>
-          </button>
           <div className="connections-status">
             <button
               className={playersMenuOpen ? 'ghost-button topbar-room-btn active' : 'ghost-button topbar-room-btn'}
               type="button"
+              title={`${t('topbar.players')} (#${currentRoomId})`}
+              aria-label={t('topbar.players')}
               onClick={() => {
                 setPlayersMenuOpen((open) => !open);
                 void loadRooms();
@@ -3966,8 +3931,6 @@ export default function App() {
             >
               <span className="online-dot" />
               <strong>{connectedCount}</strong>
-              <small className="room-tag">#{currentRoomId}</small>
-              <span>{t('topbar.players')} ▾</span>
             </button>
             {playersMenuOpen ? (
               <div className="players-popover">
@@ -4384,16 +4347,20 @@ export default function App() {
             ) : null}
             <textarea
               value={chatInput}
+              rows={1}
               placeholder={
                 composerMode === 'ooc'
-                  ? '💬 Внеигровое сообщение для друзей (OOC — нейросеть его не увидит)…'
+                  ? '💬 Внеигровое сообщение (OOC)…'
                   : composerMode === 'secret'
-                    ? '🕵️ Тайное действие для мастера ИИ (другие игроки не увидят текст, пока не раскроете)…'
+                    ? '🕵️ Тайное действие для ИИ…'
                     : t('composer.placeholder')
               }
               onChange={(event) => {
                 const val = event.target.value;
                 setChatInput(val);
+                const el = event.currentTarget;
+                el.style.height = 'auto';
+                el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
                 const now = Date.now();
                 if (!val.trim()) {
                   lastTypingSentAtRef.current = 0;
@@ -4406,20 +4373,24 @@ export default function App() {
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && (event.ctrlKey || event.metaKey || (!event.shiftKey && window.innerWidth > 900))) {
                   event.preventDefault();
+                  event.currentTarget.style.height = '';
                   void sendChatMessage();
                 }
               }}
             />
             <div className="composer-actions">
-              <button className="send-button" type="submit" aria-label={t('composer.send')} disabled={!activeChat || isGenerating || accessDenied.chats}>
-                <span>{isGenerating ? t('composer.thinking') : t('composer.send')}</span>
+              {isGenerating ? (
+                <button className="ghost-button bot-reply-button icon-only-btn" type="button" title={t('composer.cancel')} aria-label={t('composer.cancel')} onClick={() => void cancelGeneration()}>
+                  <Icon name="x" />
+                </button>
+              ) : (
+                <button className="ghost-button bot-reply-button icon-only-btn" type="button" disabled={!activeChat || accessDenied.chats || (!botReplyAllowed && !authUser?.is_admin)} title={(!botReplyAllowed && !authUser?.is_admin) ? t('composer.botReply.disabled') : t('composer.botReply')} aria-label={t('composer.botReply')} onClick={() => void requestBotReply()}>
+                  <Icon name="bot" />
+                </button>
+              )}
+              <button className="send-button icon-only-btn" type="submit" title={t('composer.send')} aria-label={t('composer.send')} disabled={!activeChat || isGenerating || accessDenied.chats}>
                 <Icon name="send" />
               </button>
-              {isGenerating ? (
-                <button className="ghost-button bot-reply-button" type="button" onClick={() => void cancelGeneration()}>{t('composer.cancel')}</button>
-              ) : (
-                <button className="ghost-button bot-reply-button" type="button" disabled={!activeChat || accessDenied.chats || (!botReplyAllowed && !authUser?.is_admin)} title={(!botReplyAllowed && !authUser?.is_admin) ? t('composer.botReply.disabled') : undefined} onClick={() => void requestBotReply()}>{t('composer.botReply')}</button>
-              )}
             </div>
           </form>
           </div>
@@ -5014,7 +4985,10 @@ function MenuOverlay({
             <span className="eyebrow">{t('menu.title')}</span>
             <h2>{activeItem.label}</h2>
           </div>
-          <button className="close-button" type="button" onClick={close}>{t('menu.close')}</button>
+          <div className="drawer-header-actions">
+            <LanguageSelector language={language} setLanguage={setLanguage} />
+            <button className="close-button" type="button" onClick={close}>{t('menu.close')}</button>
+          </div>
         </header>
 
         <div className="drawer-body">
@@ -6557,19 +6531,21 @@ function SettingsSection({
               <SliderField label="Top P" value={presetObject.top_p} fallback={1} min={0} max={1} step={0.01} onChange={(value) => updatePresetField('top_p', value)} />
             </section>
 
-            <section className="preset-card-section">
-              <h3>{t('presets.systemPrompts')}</h3>
-              <NumberInputField label={t('presets.seed')} value={presetObject.seed} fallback={-1} step={1} onChange={(value) => updatePresetField('seed', value)} />
-              <NumberInputField label={t('presets.nameInsertion')} value={presetObject.names_behavior} fallback={0} min={0} step={1} onChange={(value) => updatePresetField('names_behavior', value)} />
-              <EditableField label={t('presets.continueNudge')} value={String(presetObject.continue_nudge_prompt ?? '')} onChange={(value) => updatePresetField('continue_nudge_prompt', value)} />
-              <ToggleRow label={t('presets.continuePrefill')} checked={Boolean(presetObject.continue_prefill)} onChange={(checked) => updatePresetField('continue_prefill', checked)} />
-              <ToggleRow label={t('presets.squashSystemMessages')} checked={Boolean(presetObject.squash_system_messages)} onChange={(checked) => updatePresetField('squash_system_messages', checked)} />
-              <ToggleRow label={t('presets.functionCalling')} checked={Boolean(presetObject.function_calling)} onChange={(checked) => updatePresetField('function_calling', checked)} />
-              <ToggleRow label={t('presets.sendInlineMedia')} checked={Boolean(presetObject.send_inline_images)} onChange={(checked) => updatePresetField('send_inline_images', checked)} />
-              <ToggleRow label={t('presets.requestReasoning')} checked={presetObject.show_thoughts !== false} onChange={(checked) => updatePresetField('show_thoughts', checked)} />
-              <SelectField label={t('presets.reasoning')} value={String(presetObject.reasoning_effort ?? 'auto')} options={['auto', 'minimal', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('reasoning_effort', value)} />
-              <SelectField label="Verbosity" value={String(presetObject.verbosity ?? 'auto')} options={['auto', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('verbosity', value)} />
-            </section>
+            <details className="preset-card-section collapsible-preset-section">
+              <summary>{t('presets.systemPrompts')}</summary>
+              <div className="collapsible-section-body">
+                <NumberInputField label={t('presets.seed')} value={presetObject.seed} fallback={-1} step={1} onChange={(value) => updatePresetField('seed', value)} />
+                <NumberInputField label={t('presets.nameInsertion')} value={presetObject.names_behavior} fallback={0} min={0} step={1} onChange={(value) => updatePresetField('names_behavior', value)} />
+                <EditableField label={t('presets.continueNudge')} value={String(presetObject.continue_nudge_prompt ?? '')} onChange={(value) => updatePresetField('continue_nudge_prompt', value)} />
+                <ToggleRow label={t('presets.continuePrefill')} checked={Boolean(presetObject.continue_prefill)} onChange={(checked) => updatePresetField('continue_prefill', checked)} />
+                <ToggleRow label={t('presets.squashSystemMessages')} checked={Boolean(presetObject.squash_system_messages)} onChange={(checked) => updatePresetField('squash_system_messages', checked)} />
+                <ToggleRow label={t('presets.functionCalling')} checked={Boolean(presetObject.function_calling)} onChange={(checked) => updatePresetField('function_calling', checked)} />
+                <ToggleRow label={t('presets.sendInlineMedia')} checked={Boolean(presetObject.send_inline_images)} onChange={(checked) => updatePresetField('send_inline_images', checked)} />
+                <ToggleRow label={t('presets.requestReasoning')} checked={presetObject.show_thoughts !== false} onChange={(checked) => updatePresetField('show_thoughts', checked)} />
+                <SelectField label={t('presets.reasoning')} value={String(presetObject.reasoning_effort ?? 'auto')} options={['auto', 'minimal', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('reasoning_effort', value)} />
+                <SelectField label="Verbosity" value={String(presetObject.verbosity ?? 'auto')} options={['auto', 'low', 'medium', 'high']} onChange={(value) => updatePresetField('verbosity', value)} />
+              </div>
+            </details>
 
             <section className="preset-card-section">
               <div className="preset-title-row">
@@ -6659,32 +6635,18 @@ function SettingsSection({
     return (
       <div className="form-stack connection-settings-panel">
         {accessDenied.presets ? <AccessDeniedNotice /> : null}
-        <TwoColumns
-          left={(
-            <label className="field-preview">
-              <span>{t('connection.preset')}</span>
-              <select value={activeConnectionPresetName} onChange={(event) => void applyConnectionPreset(event.target.value)}>
-                <option value="">{t('connection.preset.select')}</option>
-                {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}{activeConnectionPresetName === preset.name ? ' · active' : ''}</option>)}
-              </select>
-            </label>
-          )}
-          right={(
-            <div className="field-preview delete-preset-field">
-              <span>{t('connection.preset.delete')}</span>
-              <div className="delete-preset-row">
-                <select value={presetToDelete} onChange={(event) => setPresetToDelete(event.target.value)}>
-                  <option value="">{t('connection.preset.select')}</option>
-                  {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
-                </select>
-                <button type="button" onClick={() => void deleteConnectionPreset(presetToDelete)}>{t('common.delete')}</button>
-              </div>
-            </div>
-          )}
-        />
-        <div className="connection-save-row">
-          <EditableField label={t('connection.preset.saveName')} value={connectionPresetName} onChange={setConnectionPresetName} />
-          <button type="button" onClick={() => void saveGenerationSettings()}>{t('connection.preset.save')}</button>
+        <div className="connection-preset-bar">
+          <label className="field-preview">
+            <span>{t('connection.preset')}</span>
+            <select value={activeConnectionPresetName} onChange={(event) => void applyConnectionPreset(event.target.value)}>
+              <option value="">{t('connection.preset.select')}</option>
+              {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}{activeConnectionPresetName === preset.name ? ' · active' : ''}</option>)}
+            </select>
+          </label>
+          <div className="connection-save-row">
+            <EditableField label={t('connection.preset.saveName')} value={connectionPresetName} onChange={setConnectionPresetName} />
+            <button type="button" onClick={() => void saveGenerationSettings()}>{t('connection.preset.save')}</button>
+          </div>
         </div>
         {(() => {
           const sourceId = generationSettings.chat_completion_source && generationSettings.chat_completion_source !== 'disabled' ? generationSettings.chat_completion_source : (generationSettings.provider === 'disabled' ? '' : generationSettings.chat_completion_source);
@@ -6738,39 +6700,6 @@ function SettingsSection({
               ) : (
                 <p className="helper-text">{t('connection.baseUrl')}: <code>{sourceMeta.default_base_url}</code></p>
               )}
-              {sourceMeta && sourceMeta.extra_field_keys.length > 0 ? (
-                <div className="connection-source-extras">
-                  {sourceMeta.extra_field_keys.map((key) => {
-                    const label = getExtraFieldLabels(t)[key] || key;
-                    const raw = sourceExtras[key];
-                    if (booleanExtraFields.has(key)) {
-                      return (
-                        <label className="field-preview" key={key}>
-                          <span>{label}</span>
-                          <input type="checkbox" checked={Boolean(raw)} onChange={(event) => updateExtras({ [key]: event.target.checked })} />
-                        </label>
-                      );
-                    }
-                    if (longTextExtraFields.has(key)) {
-                      return (
-                        <label className="field-preview" key={key}>
-                          <span>{label}</span>
-                          <textarea value={typeof raw === 'string' ? raw : ''} onChange={(event) => updateExtras({ [key]: event.target.value })} />
-                        </label>
-                      );
-                    }
-                    return (
-                      <EditableField
-                        key={key}
-                        label={label}
-                        value={typeof raw === 'string' || typeof raw === 'number' ? String(raw) : ''}
-                        onChange={(value) => updateExtras({ [key]: value })}
-                      />
-                    );
-                  })}
-                </div>
-              ) : null}
-              <p className="helper-text">{t('connection.help.botName')}</p>
               <TwoColumns
                 left={(
                   <label className="field-preview model-field">
@@ -6786,6 +6715,41 @@ function SettingsSection({
                 )}
                 right={<KeyManager mode="popover" />}
               />
+              {sourceMeta && sourceMeta.extra_field_keys.length > 0 ? (
+                <details className="connection-params-section">
+                  <summary>Дополнительные параметры запроса и заголовки</summary>
+                  <div className="connection-source-extras">
+                    {sourceMeta.extra_field_keys.map((key) => {
+                      const label = getExtraFieldLabels(t)[key] || key;
+                      const raw = sourceExtras[key];
+                      if (booleanExtraFields.has(key)) {
+                        return (
+                          <label className="field-preview checkbox-inline-field" key={key}>
+                            <input type="checkbox" checked={Boolean(raw)} onChange={(event) => updateExtras({ [key]: event.target.checked })} />
+                            <span>{label}</span>
+                          </label>
+                        );
+                      }
+                      if (longTextExtraFields.has(key)) {
+                        return (
+                          <label className="field-preview" key={key}>
+                            <span>{label}</span>
+                            <textarea value={typeof raw === 'string' ? raw : ''} onChange={(event) => updateExtras({ [key]: event.target.value })} />
+                          </label>
+                        );
+                      }
+                      return (
+                        <EditableField
+                          key={key}
+                          label={label}
+                          value={typeof raw === 'string' || typeof raw === 'number' ? String(raw) : ''}
+                          onChange={(value) => updateExtras({ [key]: value })}
+                        />
+                      );
+                    })}
+                  </div>
+                </details>
+              ) : null}
               {sourceMeta && sourceMeta.supports_reverse_proxy ? (
                 <details className="connection-proxy-section">
                   <summary>{t('connection.reverseProxy')}</summary>
@@ -6842,11 +6806,27 @@ function SettingsSection({
             </>
           );
         })()}
-        <EditableTextArea label={t('connection.systemPrompt')} value={generationSettings.system_prompt} onChange={(system_prompt) => setGenerationSettings({ ...generationSettings, system_prompt })} />
-        <TwoColumns
-          left={<NumberInputField label={t('connection.temperature')} value={generationSettings.temperature} fallback={0.8} min={0} max={2} step={0.05} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
-          right={<NumberInputField label={t('connection.maxTokens')} value={generationSettings.max_tokens} fallback={350} min={1} max={128000} step={50} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
-        />
+        <details className="connection-params-section">
+          <summary>Прочие настройки профиля (удаление, лимиты по умолчанию)</summary>
+          <div className="connection-source-extras">
+            <TwoColumns
+              left={<NumberInputField label={t('connection.temperature')} value={generationSettings.temperature} fallback={0.8} min={0} max={2} step={0.05} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
+              right={<NumberInputField label={t('connection.maxTokens')} value={generationSettings.max_tokens} fallback={350} min={1} max={128000} step={50} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
+            />
+            {connectionPresets.length > 0 ? (
+              <div className="field-preview delete-preset-field">
+                <span>{t('connection.preset.delete')}</span>
+                <div className="delete-preset-row">
+                  <select value={presetToDelete} onChange={(event) => setPresetToDelete(event.target.value)}>
+                    <option value="">{t('connection.preset.select')}</option>
+                    {connectionPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}
+                  </select>
+                  <button type="button" onClick={() => void deleteConnectionPreset(presetToDelete)}>{t('common.delete')}</button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </details>
       </div>
     );
   }
@@ -6909,6 +6889,7 @@ function SettingsSection({
             label={t('visual.textSize')}
             value={visualSettings.textScale}
             options={[
+              ['tiny', t('visual.textSize.tiny')],
               ['small', t('visual.textSize.small')],
               ['normal', t('visual.textSize.normal')],
               ['large', t('visual.textSize.large')],
@@ -7568,33 +7549,35 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
   };
 
   return (
-    <section className="preset-card-section reasoning-settings-panel">
-      <h3>{t('reasoning.title')}</h3>
-      <div className="reasoning-toggle-grid">
-        <label><input type="checkbox" checked={settings.autoParse} onChange={(event) => update({ autoParse: event.target.checked })} />{t('reasoning.autoParse')}</label>
-        <label><input type="checkbox" checked={settings.autoExpand} onChange={(event) => update({ autoExpand: event.target.checked })} />{t('reasoning.autoExpand')}</label>
-        <label><input type="checkbox" checked={settings.showHidden} onChange={(event) => update({ showHidden: event.target.checked })} />{t('reasoning.showHidden')}</label>
-        <label><input type="checkbox" checked={settings.addToPrompts} onChange={(event) => update({ addToPrompts: event.target.checked })} />{t('reasoning.addToPrompts')}</label>
-        <NumberInputField label={t('common.max')} value={settings.maxAdditions} fallback={1} min={0} max={99} step={1} onChange={(value) => typeof value === 'number' && update({ maxAdditions: value })} />
+    <details className="preset-card-section reasoning-settings-panel collapsible-preset-section">
+      <summary>{t('reasoning.title')}</summary>
+      <div className="collapsible-section-body">
+        <div className="reasoning-toggle-grid">
+          <label><input type="checkbox" checked={settings.autoParse} onChange={(event) => update({ autoParse: event.target.checked })} />{t('reasoning.autoParse')}</label>
+          <label><input type="checkbox" checked={settings.autoExpand} onChange={(event) => update({ autoExpand: event.target.checked })} />{t('reasoning.autoExpand')}</label>
+          <label><input type="checkbox" checked={settings.showHidden} onChange={(event) => update({ showHidden: event.target.checked })} />{t('reasoning.showHidden')}</label>
+          <label><input type="checkbox" checked={settings.addToPrompts} onChange={(event) => update({ addToPrompts: event.target.checked })} />{t('reasoning.addToPrompts')}</label>
+          <NumberInputField label={t('common.max')} value={settings.maxAdditions} fallback={1} min={0} max={99} step={1} onChange={(value) => typeof value === 'number' && update({ maxAdditions: value })} />
+        </div>
+        <div className="reasoning-format-row">
+          <label className="field-preview">
+            <span>{t('reasoning.formatting')}</span>
+            <select value={reasoningTemplateName(settings)} onChange={(event) => applyTemplate(event.target.value)}>
+              <option value="Custom">Custom</option>
+              <option value="DeepSeek">DeepSeek</option>
+              <option value="Think XML">Think XML</option>
+              <option value="Blank">Blank</option>
+            </select>
+          </label>
+        </div>
+        <div className="reasoning-text-grid">
+          <EditableTextArea label={t('reasoning.prefix')} value={settings.prefix} onChange={(prefix) => update({ prefix })} />
+          <EditableTextArea label={t('reasoning.suffix')} value={settings.suffix} onChange={(suffix) => update({ suffix })} />
+          <EditableTextArea label={t('reasoning.separator')} value={settings.separator} onChange={(separator) => update({ separator })} />
+        </div>
+        <EditableTextArea label={t('reasoning.assistantPrefill')} value={assistantPrefill} onChange={updateAssistantPrefill} />
       </div>
-      <div className="reasoning-format-row">
-        <label className="field-preview">
-          <span>{t('reasoning.formatting')}</span>
-          <select value={reasoningTemplateName(settings)} onChange={(event) => applyTemplate(event.target.value)}>
-            <option value="Custom">Custom</option>
-            <option value="DeepSeek">DeepSeek</option>
-            <option value="Think XML">Think XML</option>
-            <option value="Blank">Blank</option>
-          </select>
-        </label>
-      </div>
-      <div className="reasoning-text-grid">
-        <EditableTextArea label={t('reasoning.prefix')} value={settings.prefix} onChange={(prefix) => update({ prefix })} />
-        <EditableTextArea label={t('reasoning.suffix')} value={settings.suffix} onChange={(suffix) => update({ suffix })} />
-        <EditableTextArea label={t('reasoning.separator')} value={settings.separator} onChange={(separator) => update({ separator })} />
-      </div>
-      <EditableTextArea label={t('reasoning.assistantPrefill')} value={assistantPrefill} onChange={updateAssistantPrefill} />
-    </section>
+    </details>
   );
 }
 

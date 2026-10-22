@@ -2939,4 +2939,11 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
 
 frontend_dist = PROJECT_ROOT / "frontend" / "dist"
 if frontend_dist.exists():
+    @app.get("/")
+    async def serve_frontend_index() -> FileResponse:
+        return FileResponse(
+            frontend_dist / "index.html",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
+
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")

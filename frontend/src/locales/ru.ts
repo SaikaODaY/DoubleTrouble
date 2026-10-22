@@ -132,6 +132,7 @@ export default {
   'visual.palettes': 'Палитры',
   'visual.readability': 'Читаемость',
   'visual.textSize': 'Размер текста',
+  'visual.textSize.tiny': 'Очень мелкий',
   'visual.textSize.small': 'Мелкий',
   'visual.textSize.normal': 'Обычный',
   'visual.textSize.large': 'Крупный',

@@ -131,6 +131,7 @@ export default {
   'visual.palettes': 'Palettes',
   'visual.readability': 'Readability',
   'visual.textSize': 'Text size',
+  'visual.textSize.tiny': 'Tiny',
   'visual.textSize.small': 'Small',
   'visual.textSize.normal': 'Normal',
   'visual.textSize.large': 'Large',
