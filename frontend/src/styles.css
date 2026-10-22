@@ -4495,6 +4495,37 @@ textarea {
   color: var(--accent-ink);
 }
 
+.multiplayer-status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem 0.75rem;
+  padding: 0.32rem 0.65rem;
+  margin: 0 0.15rem 0.25rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-2) 86%, transparent);
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.typing-indicator-pill,
+.turn-indicator-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+}
+
+.turn-indicator-pill.my-turn strong {
+  color: var(--accent-hover);
+}
+
+.pass-turn-button {
+  padding: 0.16rem 0.48rem;
+  font-size: 0.74rem;
+  border-radius: 999px;
+}
 @media (max-width: 900px) {
   input,
   select,

@@ -169,16 +169,19 @@ class LorebooksService:
             return [item for item in entries if isinstance(item, dict)]
         return []
 
-    def active_context(self, history: list[str], card_id: str = "", chat_id: str = "", persona_id: str = "", character_book: dict[str, Any] | None = None) -> LorebookContext:
-        target_keys = {("global", ""), ("card", card_id), ("chat", chat_id), ("persona", persona_id)}
-        active_books = {binding.book for binding in self._load_bindings() if (binding.target_type, binding.target_id) in target_keys or binding.target_type == "global"}
+    def active_context(self, history: list[str], card_id: str = "", chat_id: str = "", persona_id: str | list[str] | set[str] | tuple[str, ...] = "", character_book: dict[str, Any] | None = None) -> LorebookContext:
+        persona_ids = {persona_id} if isinstance(persona_id, str) and persona_id else ({str(p) for p in persona_id if str(p).strip()} if not isinstance(persona_id, str) else set())
+        target_keys = {("global", ""), ("card", card_id), ("chat", chat_id), *(("persona", pid) for pid in persona_ids)}
+        loaded_bindings = self._load_bindings()
+        active_books = {binding.book for binding in loaded_bindings if (binding.target_type, binding.target_id) in target_keys or binding.target_type == "global"}
+        has_card_bound_book = any(binding.target_type == "card" and binding.target_id == card_id and binding.book in active_books for binding in loaded_bindings)
         books_to_scan: list[dict[str, Any]] = []
         for book_name in sorted(active_books):
             try:
                 books_to_scan.append(self.get_book(book_name))
             except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
                 continue
-        if isinstance(character_book, dict) and self._extract_entries(character_book):
+        if not has_card_bound_book and isinstance(character_book, dict) and self._extract_entries(character_book):
             books_to_scan.append(character_book)
         if not books_to_scan:
             return LorebookContext()
@@ -215,6 +218,7 @@ class LorebooksService:
         before: list[tuple[int, str]] = []
         after: list[tuple[int, str]] = []
         depth_prompts: list[dict[str, object]] = []
+        seen_entries: set[tuple[int, int, str]] = set()
         for idx in sorted(activated_indices):
             entry = all_candidates[idx]
             content = str(entry.get("content") or "").strip()
@@ -224,6 +228,10 @@ class LorebooksService:
             raw_pos = entry.get("position", 0)
             ext_pos = (entry.get("extensions") or {}).get("position") if isinstance(entry.get("extensions"), dict) else None
             position = self._int_value(ext_pos if ext_pos is not None else (1 if raw_pos == "after_char" else 0 if raw_pos == "before_char" else raw_pos), 0)
+            dedup_key = (position, order, content)
+            if dedup_key in seen_entries:
+                continue
+            seen_entries.add(dedup_key)
             if position in {1, 3, 6}:
                 after.append((order, content))
             elif position == 4:

@@ -361,12 +361,12 @@ def _active_openai_preset() -> dict[str, object] | None:
         return None
 
 
-def _generation_persona_context(request: BotReplyRequest | None) -> tuple[str | None, str | None, bool, str]:
-    if request is None:
-        return None, None, False, ""
-    known_personas = {persona.id: persona for persona in personas_service.list_personas()}
-    participants: list[GenerationParticipantRequest] = list(request.participants or [])
-    if request.persona_id or request.persona_name or request.persona_description:
+def _generation_persona_context(request: BotReplyRequest | None, history: list[Any] | None = None) -> tuple[str | None, str | None, bool, list[str]]:
+    known_list = personas_service.list_personas()
+    known_personas = {persona.id: persona for persona in known_list}
+    known_by_name = {persona.name.strip().lower(): persona for persona in known_list if persona.name.strip()}
+    participants: list[GenerationParticipantRequest] = list((request.participants if request else None) or [])
+    if request and (request.persona_id or request.persona_name or request.persona_description):
         participants.append(
             GenerationParticipantRequest(
                 persona_id=request.persona_id or "",
@@ -374,31 +374,53 @@ def _generation_persona_context(request: BotReplyRequest | None) -> tuple[str | 
                 persona_description=request.persona_description or "",
             )
         )
+    history_user_authors: list[str] = []
+    for msg in history or []:
+        if getattr(msg, "role", "") == "user" and not getattr(msg, "hidden", False):
+            author = str(getattr(msg, "author", "") or "").strip()
+            if author and author not in history_user_authors:
+                history_user_authors.append(author)
 
     by_key: dict[str, tuple[str, str]] = {}
-    primary_name = (request.persona_name or "").strip() or None
-    primary_id = (request.persona_id or "").strip()
+    persona_ids: list[str] = []
+    primary_name = ((request.persona_name if request else "") or "").strip() or None
+    primary_id = ((request.persona_id if request else "") or "").strip()
+    if primary_id and primary_id not in persona_ids:
+        persona_ids.append(primary_id)
     for participant in participants:
-        stored = known_personas.get(participant.persona_id)
-        name = (participant.persona_name or stored.name if stored else participant.persona_name).strip()
-        description = (participant.persona_description or stored.description if stored else participant.persona_description).strip()
+        stored = known_personas.get(participant.persona_id) or known_by_name.get(participant.persona_name.strip().lower())
+        name = (participant.persona_name or (stored.name if stored else "")).strip()
+        description = (participant.persona_description or (stored.description if stored else "")).strip()
         if not name:
             continue
-        key = participant.persona_id.strip() or participant.participant_id.strip() or name.lower()
+        pid = participant.persona_id.strip() or (stored.id if stored else "")
+        if pid and pid not in persona_ids:
+            persona_ids.append(pid)
+        key = pid or participant.participant_id.strip() or name.lower()
         by_key[key] = (name, description)
         if primary_id and participant.persona_id == primary_id:
             primary_name = name
+    for author in history_user_authors:
+        if any(existing_name.lower() == author.lower() for existing_name, _ in by_key.values()):
+            continue
+        stored = known_by_name.get(author.lower())
+        pid = stored.id if stored else ""
+        if pid and pid not in persona_ids:
+            persona_ids.append(pid)
+        by_key[pid or author.lower()] = (author, (stored.description if stored else "").strip())
 
     personas = list(by_key.values())
     if not personas:
-        return primary_name, (request.persona_description or "").strip() or None, False, primary_id
-    if len(personas) == 1:
-        return primary_name or personas[0][0], personas[0][1], False, primary_id
-    combined = "Active player personas in this DoubleTrouble chat:\n" + "\n".join(
-        f"- {name}: {description or 'No persona description provided.'}" for name, description in personas
+        return primary_name, ((request.persona_description if request else "") or "").strip() or None, False, persona_ids
+    if len(personas) == 1 and len(history_user_authors) <= 1:
+        return primary_name or personas[0][0], personas[0][1], False, persona_ids
+    names_str = ", ".join(name for name, _ in personas)
+    combined = (
+        f"Active player personas in this DoubleTrouble multiplayer chat ({names_str}):\n"
+        + "\n".join(f"- {name}: {description or 'No persona description provided.'}" for name, description in personas)
+        + "\nEach user message in the chat history is prefixed with the speaker's name (e.g. 'Name: message'). Respond only as {{char}} and do not write dialogue or actions on behalf of any player persona."
     )
-    return primary_name or " and ".join(name for name, _ in personas), combined, True, primary_id
-
+    return names_str, combined, True, persona_ids
 
 def _managed_key_payload(key_id: str, meta: dict[str, str]) -> dict[str, object]:
     env_name = meta.get("env_name") or ""
@@ -2193,6 +2215,13 @@ async def add_bot_chat_message(card_id: str, chat_id: str, request: ChatMessageC
         raise HTTPException(status_code=404, detail="Chat not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    if request.participant_id:
+        session_service.advance_turn(DEFAULT_SESSION_ID, request.participant_id)
+        await connection_manager.broadcast(
+            DEFAULT_SESSION_ID,
+            {"type": "typing.updated", "participant_id": request.participant_id, "name": request.author, "is_typing": False},
+        )
+        await _broadcast_presence(DEFAULT_SESSION_ID)
     await _broadcast_chat(card_id, chat_id)
     return {"chat": chat.model_dump(mode="json")}
 
@@ -2260,7 +2289,7 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
             history = chat.messages[:target_index]
         openai_preset = request.openai_preset if request and isinstance(request.openai_preset, dict) else _active_openai_preset()
         character_data = character_cards_service.card_data(card_id)
-        persona_name, persona_description, multi_user_mode, persona_id = _generation_persona_context(request)
+        persona_name, persona_description, multi_user_mode, persona_ids = _generation_persona_context(request, history)
         regex_scripts = request.regex_scripts if request else []
         user_name = persona_name or "Player"
         char_name = chat.character_name or "Bot"
@@ -2270,7 +2299,7 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
                 for message in history
             ]
         char_book = character_data.get("character_book") if isinstance(character_data.get("character_book"), dict) else None
-        lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden], card_id, chat_id, persona_id or "", character_book=char_book)
+        lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden], card_id, chat_id, persona_ids, character_book=char_book)
         if regex_scripts:
             lorebook_context = lorebook_context.model_copy(update={
                 "worldInfoBefore": RegexService.get_regexed_string(lorebook_context.worldInfoBefore, RegexService.PLACEMENT_WORLD_INFO, regex_scripts, is_prompt=True, user_name=user_name, char_name=char_name),
@@ -2562,7 +2591,20 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
             if event.type == "notification" and event.content:
                 await _broadcast_notification(event.content, session_id, event.username or event.persona_name or event.name or "")
 
-            if event.type in {"image_generation.pending", "image_generation.finished"} and event.card_id and event.chat_id and event.message_id:
+            if event.type == "typing.update" and (event.participant_id or participant_id):
+                await connection_manager.broadcast(
+                    session_id,
+                    {
+                        "type": "typing.updated",
+                        "participant_id": event.participant_id or participant_id or "",
+                        "name": event.persona_name or event.name or "Player",
+                        "is_typing": bool(event.is_typing),
+                    },
+                )
+
+            if event.type == "turn.pass" and (event.participant_id or participant_id):
+                session_service.advance_turn(session_id, event.participant_id or participant_id or "")
+                await _broadcast_presence(session_id)
                 await connection_manager.broadcast(
                     session_id,
                     {

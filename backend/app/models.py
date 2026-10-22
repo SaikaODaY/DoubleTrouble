@@ -77,3 +77,4 @@ class ClientEvent(BaseModel):
     avatar_url: str | None = None
     username: str | None = None
     is_admin: bool | None = None
+    is_typing: bool | None = None

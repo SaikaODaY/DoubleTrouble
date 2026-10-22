@@ -52,8 +52,12 @@ class SessionService:
                 participant.avatar_url = next_avatar_url
             participant.username = username.strip()
             participant.is_admin = is_admin
+            if participant.id not in session.turn.order:
+                session.turn.order.append(participant.id)
+            cur = session.turn.current_participant_id
+            if cur is None or not session.participants.get(cur) or not session.participants[cur].connected:
+                session.turn.current_participant_id = participant.id
             return participant
-
         participant = Participant(id=participant_id, name=normalized_name) if participant_id else Participant(name=normalized_name)
         participant.persona_id = persona_id.strip()
         participant.persona_name = persona_name.strip()
@@ -85,7 +89,8 @@ class SessionService:
         participant = session.participants.get(participant_id)
         if participant:
             participant.connected = False
-
+        if session.turn.current_participant_id == participant_id:
+            self._advance_turn(session, participant_id)
     def add_message(self, session_id: str, request: SendMessageRequest) -> Message:
         session = self.get_or_create_session(session_id)
         participant = session.participants.get(request.participant_id)
@@ -135,16 +140,29 @@ class SessionService:
         session = self.get_or_create_session(session_id)
         return session.model_dump(mode="json")
 
+    def advance_turn(self, session_id: str, participant_id: str) -> None:
+        session = self.get_or_create_session(session_id)
+        self._advance_turn(session, participant_id)
+
     def _advance_turn(self, session: Session, participant_id: str) -> None:
-        if not session.turn.order:
-            session.turn.current_participant_id = participant_id
-            return
-
-        try:
-            current_index = session.turn.order.index(participant_id)
-        except ValueError:
+        if participant_id and participant_id not in session.turn.order:
             session.turn.order.append(participant_id)
-            current_index = len(session.turn.order) - 1
-
-        next_index = (current_index + 1) % len(session.turn.order)
-        session.turn.current_participant_id = session.turn.order[next_index]
+        connected_order = [
+            pid for pid in session.turn.order
+            if pid in session.participants and session.participants[pid].connected and session.participants[pid].role == ParticipantRole.PLAYER
+        ]
+        if not connected_order:
+            session.turn.current_participant_id = None
+            return
+        if participant_id in connected_order:
+            next_index = (connected_order.index(participant_id) + 1) % len(connected_order)
+            session.turn.current_participant_id = connected_order[next_index]
+            return
+        if participant_id in session.turn.order:
+            start_idx = session.turn.order.index(participant_id)
+            for offset in range(1, len(session.turn.order) + 1):
+                candidate = session.turn.order[(start_idx + offset) % len(session.turn.order)]
+                if candidate in connected_order:
+                    session.turn.current_participant_id = candidate
+                    return
+        session.turn.current_participant_id = connected_order[0]

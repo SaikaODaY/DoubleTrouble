@@ -229,7 +229,10 @@ type RealtimePayload = {
   chat?: BotChat;
   switch_active?: boolean;
   active_generations?: string[];
-  session?: { participants?: Record<string, Participant>; active_card_id?: string; active_chat_id?: string };
+  session?: { participants?: Record<string, Participant>; active_card_id?: string; active_chat_id?: string; turn?: { current_participant_id?: string | null; order?: string[] } };
+  participant_id?: string;
+  name?: string;
+  is_typing?: boolean;
   message?: string;
   message_id?: string;
   replace_message_id?: string | null;
@@ -734,6 +737,10 @@ export default function App() {
   const [activePresets, setActivePresets] = useState<Record<string, string>>({});
   const [editingPromptId, setEditingPromptId] = useState('');
   const [participants, setParticipants] = useState<Participant[]>([]);
+  const [currentTurnParticipantId, setCurrentTurnParticipantId] = useState<string | null>(null);
+  const [typingPlayers, setTypingPlayers] = useState<Record<string, string>>({});
+  const lastTypingSentAtRef = useRef(0);
+  const typingTimersRef = useRef<Record<string, number>>({});
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string } | null>(null);
   const [imagePendingMessages, setImagePendingMessages] = useState<Record<string, boolean>>({});
@@ -1257,6 +1264,30 @@ export default function App() {
             selectDefaultPersonaIfNeeded();
           }
           setParticipants(nextParticipants);
+          if (payload.session.turn !== undefined) {
+            setCurrentTurnParticipantId(payload.session.turn?.current_participant_id || null);
+          }
+        }
+        if (payload.type === 'typing.updated' && payload.participant_id && payload.participant_id !== participantIdRef.current) {
+          const pid = payload.participant_id;
+          window.clearTimeout(typingTimersRef.current[pid]);
+          if (payload.is_typing) {
+            const displayName = payload.name || 'Player';
+            setTypingPlayers((current) => ({ ...current, [pid]: displayName }));
+            typingTimersRef.current[pid] = window.setTimeout(() => {
+              setTypingPlayers((current) => {
+                const next = { ...current };
+                delete next[pid];
+                return next;
+              });
+            }, 4200);
+          } else {
+            setTypingPlayers((current) => {
+              const next = { ...current };
+              delete next[pid];
+              return next;
+            });
+          }
         }
         if (payload.type === 'notification' && payload.message) {
           addToast(payload.message);
@@ -3554,6 +3585,35 @@ export default function App() {
               ↓
             </button>
           ) : null}
+          {(connectedPlayers.length > 1 || Object.keys(typingPlayers).length > 0) ? (
+            <div className="multiplayer-status-bar">
+              {Object.keys(typingPlayers).length > 0 ? (
+                <span className="typing-indicator-pill">
+                  <span className="thinking-dots"><i /><i /><i /></span>
+                  <strong>{Object.values(typingPlayers).join(', ')}</strong> печатает…
+                </span>
+              ) : null}
+              {connectedPlayers.length > 1 ? (() => {
+                const turnPlayer = connectedPlayers.find((p) => p.id === currentTurnParticipantId) || connectedPlayers[0];
+                const isMyTurn = turnPlayer?.id === participantIdRef.current;
+                return (
+                  <span className={isMyTurn ? 'turn-indicator-pill my-turn' : 'turn-indicator-pill'}>
+                    <span>{isMyTurn ? 'Ваш ход:' : 'Очередь хода:'}</span>
+                    <strong>{turnPlayer?.persona_name || turnPlayer?.name || 'Player'}</strong>
+                    {isMyTurn ? (
+                      <button
+                        type="button"
+                        className="ghost-button pass-turn-button"
+                        onClick={() => sendRealtimeEvent({ type: 'turn.pass', participant_id: participantIdRef.current })}
+                      >
+                        Передать ход →
+                      </button>
+                    ) : null}
+                  </span>
+                );
+              })() : null}
+            </div>
+          ) : null}
 
           <form id="send_form" className="composer" onSubmit={(event) => { event.preventDefault(); void sendChatMessage(); }}>
             <button className="composer-menu-button" type="button" aria-label={t('composer.actions')} onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
@@ -3598,7 +3658,28 @@ export default function App() {
                 ))}
               </div>
             ) : null}
-            <textarea value={chatInput} placeholder={t('composer.placeholder')} onChange={(event) => setChatInput(event.target.value)} />
+            <textarea
+              value={chatInput}
+              placeholder={t('composer.placeholder')}
+              onChange={(event) => {
+                const val = event.target.value;
+                setChatInput(val);
+                const now = Date.now();
+                if (!val.trim()) {
+                  lastTypingSentAtRef.current = 0;
+                  sendRealtimeEvent({ type: 'typing.update', participant_id: participantIdRef.current, persona_name: selectedPersona?.name || 'Player', is_typing: false });
+                } else if (now - lastTypingSentAtRef.current > 1800) {
+                  lastTypingSentAtRef.current = now;
+                  sendRealtimeEvent({ type: 'typing.update', participant_id: participantIdRef.current, persona_name: selectedPersona?.name || 'Player', is_typing: true });
+                }
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey || (!event.shiftKey && window.innerWidth > 900))) {
+                  event.preventDefault();
+                  void sendChatMessage();
+                }
+              }}
+            />
             <div className="composer-actions">
               <button className="send-button" type="submit" aria-label={t('composer.send')} disabled={!activeChat || isGenerating || accessDenied.chats}>
                 <span>{isGenerating ? t('composer.thinking') : t('composer.send')}</span>

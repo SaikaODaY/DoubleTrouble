@@ -312,17 +312,33 @@ class GenerationService:
     def _history_messages(self, history: list[BotChatMessage], preset: dict[str, Any] | None = None, force_user_names: bool = False, character_name: str = "", persona_name: str = "") -> list[ChatMessage]:
         messages: list[ChatMessage] = []
         names_behavior = self._int_from_preset(preset, "names_behavior", 0)
-        for message in history[-40:]:
+        max_context = self._int_from_preset(preset, "openai_max_context", 0)
+        max_gen = self._int_from_preset(preset, "openai_max_tokens", self._int_from_preset(preset, "max_tokens", self.config.max_tokens))
+        char_budget = max(2000, int((max_context - max_gen - 900) * 3.5)) if max_context > 0 else 0
+        selected_history: list[BotChatMessage] = []
+        used_chars = 0
+        for message in reversed(history[-200:]):
+            msg_len = len(message.content or "") + len(message.author or "") + 8
+            if char_budget > 0 and selected_history and (used_chars + msg_len > char_budget):
+                break
+            selected_history.append(message)
+            used_chars += msg_len
+            if char_budget == 0 and len(selected_history) >= 60:
+                break
+        selected_history.reverse()
+        for message in selected_history:
             role = "assistant" if message.role == "assistant" else "user"
-            content = self._substitute_prompt(message.content, character_name, persona_name)
+            msg_user = (message.author or persona_name) if role == "user" else persona_name
+            content = self._substitute_prompt(message.content, character_name, msg_user)
             name = None
             if (force_user_names or names_behavior == 2) and role == "user" and message.author:
-                content = f"{message.author}: {content}"
+                prefix = f"{message.author}:"
+                if not content.startswith(prefix):
+                    content = f"{message.author}: {content}"
             elif names_behavior == 1 and message.author:
                 name = self._sanitize_openai_name(message.author)
             messages.append(ChatMessage(role=role, content=content, name=name))
         return messages
-
     def _tavern_openai_messages(self, preset: dict[str, Any] | None, character_name: str, persona_name: str, persona_description: str, character_data: dict[str, Any], history_messages: list[ChatMessage], world_info: dict[str, Any]) -> list[ChatMessage]:
         if not isinstance(preset, dict):
             return []
