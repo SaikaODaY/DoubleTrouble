@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import asyncio
 import logging
@@ -226,13 +227,38 @@ async def _broadcast_generation_state(card_id: str, chat_id: str, event_type: st
     for target_sid in _target_sessions_for_chat(card_id, chat_id, session_id, False):
         await connection_manager.broadcast(target_sid, event)
 
+def _frontend_build_info() -> tuple[str, str]:
+    index_path = PROJECT_ROOT / "frontend" / "dist" / "index.html"
+    if not index_path.exists():
+        return "dev", ""
+    try:
+        raw = index_path.read_text(encoding="utf-8")
+        build_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        match = re.search(r'src="[^"]*/(index-[^"/]+\.js)"', raw)
+        return build_id, (match.group(1) if match else "")
+    except OSError:
+        return "dev", ""
+
+
+def _apply_cache_bust_headers(request: Request, response: Response) -> str:
+    build_id, _ = _frontend_build_info()
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["CDN-Cache-Control"] = "no-store"
+    response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
+    if build_id and request.cookies.get("dt_build_id") != build_id:
+        response.headers["Clear-Site-Data"] = '"cache"'
+        response.set_cookie("dt_build_id", build_id, path="/", max_age=31536000, samesite="lax")
+    return build_id
+
+
 async def _broadcast_presence(session_id: str = DEFAULT_SESSION_ID) -> None:
+    session_service.prune_disconnected(session_id, connection_manager.active_participant_ids(session_id))
     await connection_manager.broadcast(
         session_id,
         {"type": "presence.updated", "session": session_service.snapshot(session_id)},
     )
-
-
 def _actor_from_request(request: Request) -> str:
     actor = unquote(request.headers.get("x-doubletrouble-actor", "").strip())
     user = _auth_user_from_request(request)
@@ -819,8 +845,17 @@ def _transparent_png() -> bytes:
 
 
 @app.get("/script.js")
-async def script_compat_module() -> Response:
-    content = """
+async def script_compat_module(request: Request) -> Response:
+    _, expected_bundle = _frontend_build_info()
+    bundle_guard = f"""
+const __dtExpectedBundle = {json.dumps(expected_bundle)};
+if (__dtExpectedBundle && typeof document !== 'undefined' && !Array.from(document.scripts).some((s) => (s.src || '').includes(__dtExpectedBundle))) {{
+  if (!globalThis.location?.search?.includes('_v=' + __dtExpectedBundle)) {{
+    globalThis.location?.replace?.(globalThis.location.pathname + '?_v=' + encodeURIComponent(__dtExpectedBundle));
+  }}
+}}
+""".strip()
+    content = bundle_guard + "\n" + """
 const ctx = () => globalThis.SillyTavern?.getContext?.() || {};
 export const eventSource = ctx().eventSource;
 export const event_types = ctx().event_types || ctx().eventTypes || {};
@@ -901,8 +936,9 @@ export const generateRaw = async (...args) => ctx().generateRaw ? await ctx().ge
 export const Generate = async (type, opts = {}) => ctx().Generate ? await ctx().Generate(type, opts) : await generateQuietPrompt(opts?.quiet_prompt || '');
 export default {};
 """.strip()
-    return Response(content=content, media_type="text/javascript; charset=utf-8")
-
+    resp = Response(content=content, media_type="text/javascript; charset=utf-8")
+    _apply_cache_bust_headers(request, resp)
+    return resp
 
 @app.get("/scripts/{module_path:path}")
 async def scripts_compat_module(module_path: str) -> Response:
@@ -1278,15 +1314,16 @@ async def extension_user_avatar(filename: str, request: Request) -> Response:
 
 
 @app.get("/api/config/public")
-async def public_config() -> dict[str, object]:
+async def public_config(request: Request, response: Response) -> dict[str, object]:
+    build_id = _apply_cache_bust_headers(request, response)
     return {
+        "build_id": build_id,
         "server": {"public_url": config.server.public_url},
         "auth": {"mode": config.auth.mode, "required": settings_service.auth_required()},
         "registration_allowed": settings_service.registration_allowed(),
         "access_password_required": settings_service.access_password_required(),
         "default_session_id": DEFAULT_SESSION_ID,
     }
-
 
 @app.post("/api/auth/register")
 async def auth_register(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
@@ -1369,13 +1406,14 @@ async def get_security_permissions() -> dict[str, object]:
 
 
 @app.get("/api/security/config")
-async def get_security_config() -> dict[str, object]:
+async def get_security_config(request: Request, response: Response) -> dict[str, object]:
+    build_id = _apply_cache_bust_headers(request, response)
     return {
+        "build_id": build_id,
         "cookie_auth": config.security.cookie_auth,
         "cookie_secure": config.security.cookie_secure,
         "cookie_samesite": config.security.cookie_samesite,
     }
-
 
 @app.get("/api/security/access")
 async def get_access_password_status(request: Request) -> dict[str, object]:
@@ -2822,6 +2860,7 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
         return
     participant_id: str | None = None
     try:
+        session_service.prune_disconnected(session_id, connection_manager.active_participant_ids(session_id))
         await websocket.send_json({
             "type": "session.snapshot",
             "session": session_service.snapshot(session_id),
@@ -2838,36 +2877,26 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_json({"type": "pong"})
                 continue
 
-            if event.type == "participant.join":
+            if event.type in {"participant.join", "presence.update"}:
+                ws_user = auth_service.user_by_token(_token_from_websocket(websocket))
+                resolved_username = ws_user.username if ws_user else (event.username or "")
+                resolved_is_admin = bool(ws_user.is_admin) if ws_user else bool(event.is_admin)
+                incoming_pid = event.participant_id or participant_id
                 participant = session_service.join_session(
                     session_id,
                     event.name or event.persona_name or "Player",
-                    event.participant_id,
+                    incoming_pid,
                     event.persona_id or "",
                     event.persona_name or "",
                     event.avatar_url or "",
-                    event.username or "",
-                    bool(event.is_admin),
+                    resolved_username,
+                    resolved_is_admin,
                 )
+                if incoming_pid and incoming_pid != participant.id:
+                    connection_manager.rebind_participant(session_id, incoming_pid, participant.id)
                 participant_id = participant.id
                 connection_manager.bind_participant(session_id, websocket, participant.id)
                 await _broadcast_presence(session_id)
-
-            if event.type == "presence.update" and event.participant_id:
-                participant = session_service.update_presence(
-                    session_id,
-                    event.participant_id,
-                    event.name or event.persona_name or "Player",
-                    event.persona_id or "",
-                    event.persona_name or "",
-                    event.avatar_url or "",
-                    event.username or "",
-                    bool(event.is_admin),
-                )
-                participant_id = participant.id
-                connection_manager.bind_participant(session_id, websocket, participant.id)
-                await _broadcast_presence(session_id)
-
             if event.type == "card.select" and event.name:
                 if event.card_id:
                     session_service.set_active_chat(session_id, event.card_id, event.chat_id or "")
@@ -2954,10 +2983,13 @@ async def session_websocket(websocket: WebSocket, session_id: str) -> None:
 frontend_dist = PROJECT_ROOT / "frontend" / "dist"
 if frontend_dist.exists():
     @app.get("/")
-    async def serve_frontend_index() -> FileResponse:
-        return FileResponse(
-            frontend_dist / "index.html",
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    @app.get("/index.html")
+    async def serve_frontend_index(request: Request) -> Response:
+        resp = Response(
+            content=(frontend_dist / "index.html").read_bytes(),
+            media_type="text/html; charset=utf-8",
         )
+        _apply_cache_bust_headers(request, resp)
+        return resp
 
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")

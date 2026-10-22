@@ -10,7 +10,7 @@ frontend/dist
 data
 config
 docs
-*.md
+/README.md
 start.bat
 start.ps1
 start.sh

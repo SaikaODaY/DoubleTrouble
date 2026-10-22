@@ -19,6 +19,21 @@ class ConnectionManager:
         if participant_id:
             self.socket_participants[(session_id, websocket)] = participant_id
 
+    def rebind_participant(self, session_id: str, old_participant_id: str, new_participant_id: str) -> None:
+        if not old_participant_id or not new_participant_id or old_participant_id == new_participant_id:
+            return
+        for key, pid in list(self.socket_participants.items()):
+            if key[0] == session_id and pid == old_participant_id:
+                self.socket_participants[key] = new_participant_id
+
+    def active_participant_ids(self, session_id: str) -> set[str]:
+        active: set[str] = set()
+        for ws in list(self.connections.get(session_id, ())):
+            pid = self.socket_participants.get((session_id, ws))
+            if pid:
+                active.add(pid)
+        return active
+
     def has_other_connections(self, session_id: str, participant_id: str, exclude_websocket: WebSocket | None = None) -> bool:
         if not participant_id:
             return False
@@ -28,7 +43,6 @@ class ConnectionManager:
             if self.socket_participants.get((session_id, ws)) == participant_id:
                 return True
         return False
-
     def disconnect(self, session_id: str, websocket: WebSocket) -> str | None:
         participant_id = self.socket_participants.pop((session_id, websocket), None)
         if session_id in self.connections:

@@ -54,9 +54,24 @@ class SessionService:
     ) -> Participant:
         session = self.get_or_create_session(session_id)
         normalized_name = name.strip() or "Player"
+        clean_username = username.strip()
 
-        if participant_id and participant_id in session.participants:
-            participant = session.participants[participant_id]
+        existing_by_username: Participant | None = None
+        if clean_username:
+            existing_by_username = next(
+                (
+                    p for p in session.participants.values()
+                    if p.role == ParticipantRole.PLAYER and p.username and p.username.lower() == clean_username.lower()
+                ),
+                None,
+            )
+
+        target_id = participant_id
+        if existing_by_username is not None:
+            target_id = existing_by_username.id
+
+        if target_id and target_id in session.participants:
+            participant = session.participants[target_id]
             next_persona_id = persona_id.strip()
             next_persona_name = persona_name.strip()
             next_avatar_url = avatar_url.strip()
@@ -70,27 +85,42 @@ class SessionService:
                 participant.persona_id = next_persona_id
                 participant.persona_name = next_persona_name
                 participant.avatar_url = next_avatar_url
-            participant.username = username.strip()
+            if clean_username or not participant.username:
+                participant.username = clean_username
             participant.is_admin = is_admin
-            if participant.id not in session.turn.order:
-                session.turn.order.append(participant.id)
-            cur = session.turn.current_participant_id
-            if cur is None or not session.participants.get(cur) or not session.participants[cur].connected:
+        else:
+            participant = Participant(id=target_id, name=normalized_name) if target_id else Participant(name=normalized_name)
+            participant.persona_id = persona_id.strip()
+            participant.persona_name = persona_name.strip()
+            participant.avatar_url = avatar_url.strip()
+            participant.username = clean_username
+            participant.is_admin = is_admin
+            session.participants[participant.id] = participant
+
+        # Remove any duplicate entries for the same logged-in username or superseded participant_id
+        duplicate_ids: list[str] = []
+        if participant_id and participant_id != participant.id and participant_id in session.participants:
+            duplicate_ids.append(participant_id)
+        if clean_username:
+            for pid, p in list(session.participants.items()):
+                if pid != participant.id and p.role == ParticipantRole.PLAYER and p.username and p.username.lower() == clean_username.lower():
+                    if pid not in duplicate_ids:
+                        duplicate_ids.append(pid)
+        for dup_id in duplicate_ids:
+            session.participants.pop(dup_id, None)
+            while dup_id in session.turn.order:
+                session.turn.order.remove(dup_id)
+            while dup_id in session.turn.ready_participant_ids:
+                session.turn.ready_participant_ids.remove(dup_id)
+            if session.turn.current_participant_id == dup_id:
                 session.turn.current_participant_id = participant.id
-            return participant
-        participant = Participant(id=participant_id, name=normalized_name) if participant_id else Participant(name=normalized_name)
-        participant.persona_id = persona_id.strip()
-        participant.persona_name = persona_name.strip()
-        participant.avatar_url = avatar_url.strip()
-        participant.username = username.strip()
-        participant.is_admin = is_admin
-        session.participants[participant.id] = participant
+
         if participant.id not in session.turn.order:
             session.turn.order.append(participant.id)
-        if session.turn.current_participant_id is None:
+        cur = session.turn.current_participant_id
+        if cur is None or not session.participants.get(cur) or not session.participants[cur].connected:
             session.turn.current_participant_id = participant.id
         return participant
-
     def update_presence(
         self,
         session_id: str,
@@ -114,6 +144,26 @@ class SessionService:
         if session.turn.current_participant_id == participant_id:
             self._advance_turn(session, participant_id)
 
+
+    def prune_disconnected(self, session_id: str, active_pids: set[str]) -> None:
+        session = self.get_or_create_session(session_id)
+        for pid, p in list(session.participants.items()):
+            if p.role == ParticipantRole.PLAYER and p.connected and pid not in active_pids:
+                self.disconnect_participant(session_id, pid)
+        seen_usernames: dict[str, str] = {}
+        for pid, p in list(session.participants.items()):
+            if p.role != ParticipantRole.PLAYER or not p.username:
+                continue
+            uname = p.username.lower()
+            if uname in seen_usernames:
+                keep_pid = seen_usernames[uname]
+                if p.connected and not session.participants[keep_pid].connected:
+                    session.participants.pop(keep_pid, None)
+                    seen_usernames[uname] = pid
+                else:
+                    session.participants.pop(pid, None)
+            else:
+                seen_usernames[uname] = pid
     def add_message(self, session_id: str, request: SendMessageRequest) -> Message:
         session = self.get_or_create_session(session_id)
         participant = session.participants.get(request.participant_id)

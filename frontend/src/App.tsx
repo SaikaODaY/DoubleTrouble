@@ -912,7 +912,15 @@ export default function App() {
   const activeMessages = activeChat?.messages ?? [];
   const reasoningDisplay = useMemo(() => reasoningSettingsFromPreset(parsePresetDraft(presetJsonDraft)), [presetJsonDraft]);
   const selectedPersona = useMemo(() => personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null, [personas, selectedPersonaId]);
-  const connectedPlayers = useMemo(() => participants.filter((participant) => participant.connected && participant.role === 'player'), [participants]);
+  const connectedPlayers = useMemo(() => {
+    const byKey = new Map<string, Participant>();
+    for (const participant of participants) {
+      if (!participant.connected || participant.role !== 'player') continue;
+      const key = participant.username ? `user:${participant.username.toLowerCase()}` : participant.id;
+      byKey.set(key, participant);
+    }
+    return Array.from(byKey.values());
+  }, [participants]);
   const activeReferencePersonas = useMemo(() => {
     const byKey = new Map<string, Persona>();
     const addPersona = (persona: Persona | null, participant?: Participant) => {
@@ -935,7 +943,7 @@ export default function App() {
     addPersona(selectedPersona);
     return Array.from(byKey.values());
   }, [connectedPlayers, personas, selectedPersona]);
-  const connectedCount = useMemo(() => participants.filter((participant) => participant.connected).length, [participants]);
+  const connectedCount = connectedPlayers.length;
   const showScrollBottomRef = useRef(false);
   const websocketRef = useRef<WebSocket | null>(null);
   const pendingRealtimeEventsRef = useRef<Record<string, unknown>[]>([]);
@@ -1086,10 +1094,21 @@ export default function App() {
   }, [generationStreamText, isGenerating]);
 
   useEffect(() => {
+    if (window.location.search.includes('_v=')) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
     void (async () => {
       try {
-        const response = await fetch('/api/security/config');
-        const data = await response.json() as { cookie_auth?: boolean } | null;
+        const response = await fetch(`/api/security/config?_t=${Date.now()}`, { cache: 'no-store' });
+        const data = await response.json() as { cookie_auth?: boolean; build_id?: string } | null;
+        if (data?.build_id && data.build_id !== 'dev') {
+          const prevBuild = window.localStorage.getItem('doubletrouble.buildId');
+          window.localStorage.setItem('doubletrouble.buildId', data.build_id);
+          if (prevBuild && prevBuild !== data.build_id) {
+            window.location.replace(`${window.location.pathname}?_v=${encodeURIComponent(data.build_id)}`);
+            return;
+          }
+        }
         setCookieAuth(Boolean(data?.cookie_auth));
       } catch {
         setCookieAuth(false);
