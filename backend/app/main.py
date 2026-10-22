@@ -1351,7 +1351,11 @@ async def auth_login(payload: AuthRequest, request: Request, response: Response)
     _check_auth_rate_limit(_request_client_ip(request))
     _require_access_password(request)
     try:
-        user, token = auth_service.login(payload.username, payload.password)
+        if not auth_service.state.users and settings_service.registration_allowed():
+            user, token = auth_service.register(payload.username, payload.password)
+            personas_service.list_personas(owner=user.username, is_admin=user.is_admin)
+        else:
+            user, token = auth_service.login(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
     response.set_cookie(
