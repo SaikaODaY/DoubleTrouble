@@ -82,11 +82,16 @@ class OpenAICompatibleProvider:
             raise RuntimeError("LLM model is not configured")
 
         body = self._request_body(request, stream=True)
+        stream_headers = {
+            **self._headers(),
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+        }
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
             async with client.stream(
                 "POST",
                 f"{self.base_url}{self.chat_path}",
-                headers=self._headers(),
+                headers=stream_headers,
                 json=body,
                 params=self.extra_query or None,
             ) as response:
@@ -94,27 +99,27 @@ class OpenAICompatibleProvider:
                     await response.aread()
                 response.raise_for_status()
                 emitted = False
-                buffered_text = ""
-                async for chunk in response.aiter_text():
-                    buffered_text += chunk
-                    events, buffered_text = self._split_sse_events(buffered_text)
-                    line_events, buffered_text = self._split_line_events(buffered_text)
-                    events.extend(line_events)
-                    for event in events:
+                raw_lines: list[str] = []
+                async for line in response.aiter_lines():
+                    raw_lines.append(line)
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith(":"):
+                        continue
+                    token = self._stream_token(stripped)
+                    if token:
+                        emitted = True
+                        yield token
+                if not emitted and raw_lines:
+                    joined = "\n".join(raw_lines)
+                    for event in self._remaining_stream_events(joined):
                         token = self._stream_token(event)
                         if token:
                             emitted = True
                             yield token
-                for event in self._remaining_stream_events(buffered_text):
-                    token = self._stream_token(event)
-                    if token:
-                        emitted = True
-                        yield token
-                if not emitted and buffered_text:
-                    content = self._content_from_non_stream_payload(buffered_text)
-                    if content:
-                        yield content
-
+                    if not emitted:
+                        content = self._content_from_non_stream_payload(joined)
+                        if content:
+                            yield content
     def _request_body(self, request: GenerationRequest, stream: bool) -> dict[str, Any]:
         parameters = dict(request.parameters)
         excluded_body_keys = {str(key) for key in parameters.pop("__exclude_body_keys", [])}

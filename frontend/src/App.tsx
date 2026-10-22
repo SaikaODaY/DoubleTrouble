@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { Fragment, memo, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { emitSillyTavernChatChanged, emitSillyTavernGenerationEvent, emitSillyTavernMessageRendered, emitSillyTavernMessageSwiped, executeExtensionSlashCommand, formatExtensionMessageHtml, getActiveExtensionPrompts, initSillyTavernExtensions, syncServerExtensionSettings, syncSillyTavernExtensions, updateSillyTavernExtensionSettings, updateSillyTavernRuntime, type ExtensionMessageFormatOptions } from './sillyTavernExtensions';
 import { allowScopedScripts, getRegexedString, getRegexScripts, regex_placement, saveScriptsByType, SCRIPT_TYPES, setRegexContext, setRegexNames, type RegexScript } from './regexEngine';
@@ -568,7 +568,7 @@ const defaultVisualSettings: VisualSettings = {
 };
 
 const themes: Array<{ id: ThemeId; name: string; description: string; swatches: string[]; tone: 'dark' | 'light' }> = [
-  { id: 'midnight', name: 'Midnight', description: 'theme.midnight', swatches: ['#0f1418', '#1d2630', '#d8a75f', '#73b7a7'], tone: 'dark' },
+  { id: 'midnight', name: 'Midnight', description: 'theme.midnight', swatches: ['#090a0d', '#171a21', '#7c8aff', '#56d4b0'], tone: 'dark' },
   { id: 'abyss', name: 'Abyss', description: 'theme.abyss', swatches: ['#000000', '#0a0a0a', '#d6b46a', '#6fb5a5'], tone: 'dark' },
   { id: 'forest', name: 'Forest', description: 'theme.forest', swatches: ['#0f1712', '#1c2a20', '#c69a55', '#7fb069'], tone: 'dark' },
   { id: 'ocean', name: 'Ocean', description: 'theme.ocean', swatches: ['#0c1420', '#172638', '#7fb7ff', '#76d1cf'], tone: 'dark' },
@@ -625,10 +625,22 @@ function loadVisualSettings(): VisualSettings {
   }
 }
 
+let cachedBuiltInExtensionSettings: BuiltInExtensionSettings | null = null;
+
+function saveBuiltInExtensionSettings(nextSettings: BuiltInExtensionSettings): void {
+  cachedBuiltInExtensionSettings = nextSettings;
+  window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+}
+
 function loadBuiltInExtensionSettings(): BuiltInExtensionSettings {
+  if (cachedBuiltInExtensionSettings) {
+    return cachedBuiltInExtensionSettings;
+  }
   try {
-    return { ...defaultBuiltInExtensionSettings, ...JSON.parse(window.localStorage.getItem(BUILT_IN_EXTENSIONS_STORAGE_KEY) || '{}') };
+    cachedBuiltInExtensionSettings = { ...defaultBuiltInExtensionSettings, ...JSON.parse(window.localStorage.getItem(BUILT_IN_EXTENSIONS_STORAGE_KEY) || '{}') };
+    return cachedBuiltInExtensionSettings;
   } catch {
+    cachedBuiltInExtensionSettings = defaultBuiltInExtensionSettings;
     return defaultBuiltInExtensionSettings;
   }
 }
@@ -791,6 +803,7 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationStatus, setGenerationStatus] = useState('');
   const [generationStreamText, setGenerationStreamText] = useState('');
+  const [displayedStreamText, setDisplayedStreamText] = useState('');
   const [generationReplaceMessageId, setGenerationReplaceMessageId] = useState<string | null>(null);
   const [topbarVisible, setTopbarVisible] = useState(true);
   const [chatRenameDrafts, setChatRenameDrafts] = useState<Record<string, string>>({});
@@ -895,10 +908,10 @@ export default function App() {
   const [deletionLocks, setDeletionLocks] = useState<DeletionLocks>(defaultDeletionLocks);
   const [pendingDeleteKey, setPendingDeleteKey] = useState('');
   const activeMessages = activeChat?.messages ?? [];
-  const reasoningDisplay = reasoningSettingsFromPreset(parsePresetDraft(presetJsonDraft));
-  const selectedPersona = personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null;
-  const connectedPlayers = participants.filter((participant) => participant.connected && participant.role === 'player');
-  const activeReferencePersonas = (() => {
+  const reasoningDisplay = useMemo(() => reasoningSettingsFromPreset(parsePresetDraft(presetJsonDraft)), [presetJsonDraft]);
+  const selectedPersona = useMemo(() => personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null, [personas, selectedPersonaId]);
+  const connectedPlayers = useMemo(() => participants.filter((participant) => participant.connected && participant.role === 'player'), [participants]);
+  const activeReferencePersonas = useMemo(() => {
     const byKey = new Map<string, Persona>();
     const addPersona = (persona: Persona | null, participant?: Participant) => {
       const id = persona?.id || participant?.persona_id || participant?.id || '';
@@ -919,8 +932,9 @@ export default function App() {
     connectedPlayers.forEach((participant) => addPersona(participant.persona_id ? personas.find((persona) => persona.id === participant.persona_id) || null : null, participant));
     addPersona(selectedPersona);
     return Array.from(byKey.values());
-  })();
-  const connectedCount = participants.filter((participant) => participant.connected).length;
+  }, [connectedPlayers, personas, selectedPersona]);
+  const connectedCount = useMemo(() => participants.filter((participant) => participant.connected).length, [participants]);
+  const showScrollBottomRef = useRef(false);
   const websocketRef = useRef<WebSocket | null>(null);
   const pendingRealtimeEventsRef = useRef<Record<string, unknown>[]>([]);
   const requestBotReplyRef = useRef<(replaceMessageId?: string, sourceChat?: BotChat, resetSwipes?: boolean) => Promise<void>>(() => Promise.resolve());
@@ -954,6 +968,7 @@ export default function App() {
   const activePresetDraftSignatureRef = useRef('');
   const generationSettingsLoadedRef = useRef(false);
   const generationSettingsSaveSignatureRef = useRef('');
+  const lastLocalSettingsSaveRef = useRef<Record<string, number>>({});
   const renderedExtensionMessageSignaturesRef = useRef<Map<string, string>>(new Map());
   const activeGenerationRef = useRef(false);
   const extensionLeaderId = connectedPlayers.length
@@ -1026,10 +1041,40 @@ export default function App() {
     void loadGenerationSettings();
     void loadConnectionPresets();
     void loadPresetTypes();
+    void loadActivePresetDraft();
     void loadLorebooks();
     void loadSecurityPermissions();
     void loadDeleteLocks();
   }, []);
+
+  useEffect(() => {
+    if (!isGenerating || !generationStreamText) {
+      setDisplayedStreamText('');
+      return;
+    }
+    let rafId = 0;
+    let lastTime = performance.now();
+    const tick = (now: number) => {
+      setDisplayedStreamText((prev) => {
+        if (prev === generationStreamText) return prev;
+        if (!generationStreamText.startsWith(prev)) {
+          return generationStreamText;
+        }
+        const remaining = generationStreamText.length - prev.length;
+        if (remaining <= 0) return prev;
+        const dt = Math.max(8, now - lastTime);
+        lastTime = now;
+        const step = Math.max(1, Math.ceil(remaining * Math.min(0.32, dt / 85)));
+        return generationStreamText.slice(0, prev.length + step);
+      });
+      if (isNearBottomRef.current && chatScrollRef.current) {
+        chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+      }
+      rafId = window.requestAnimationFrame(tick);
+    };
+    rafId = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(rafId);
+  }, [generationStreamText, isGenerating]);
 
   useEffect(() => {
     void (async () => {
@@ -1080,39 +1125,29 @@ export default function App() {
     }
     el.scrollTo({ top: el.scrollHeight, behavior });
     isNearBottomRef.current = true;
-    setShowScrollBottomButton(false);
+    if (showScrollBottomRef.current) {
+      showScrollBottomRef.current = false;
+      setShowScrollBottomButton(false);
+    }
   };
 
-  const updateTopbarForScroll = (currentY: number, scrollEl?: HTMLDivElement | null) => {
+  const updateTopbarForScroll = (_currentY: number, scrollEl?: HTMLDivElement | null) => {
     if (scrollEl) {
       const distanceFromBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
       const nearBottom = distanceFromBottom < 180;
       isNearBottomRef.current = nearBottom;
-      setShowScrollBottomButton(!nearBottom && scrollEl.scrollHeight - scrollEl.clientHeight > 240);
+      const shouldShow = !nearBottom && scrollEl.scrollHeight - scrollEl.clientHeight > 240;
+      if (showScrollBottomRef.current !== shouldShow) {
+        showScrollBottomRef.current = shouldShow;
+        setShowScrollBottomButton(shouldShow);
+      }
     }
-    if (window.matchMedia('(max-width: 900px)').matches) {
-      setTopbarVisible(true);
-      topbarScrollYRef.current = currentY;
-      return;
-    }
-    const lastY = topbarScrollYRef.current;
-    if (currentY < 24) {
-      setTopbarVisible(true);
-    } else if (currentY < lastY - 8) {
-      setTopbarVisible(true);
-    } else if (currentY > lastY + 8) {
-      setTopbarVisible(false);
-    }
-    topbarScrollYRef.current = currentY;
   };
 
   useEffect(() => {
-    const onScroll = () => updateTopbarForScroll(window.scrollY);
     const onRegexUpdated = () => setRegexRenderTick((tick) => tick + 1);
-    window.addEventListener('scroll', onScroll, { passive: true });
     window.addEventListener('doubletrouble:regex-updated', onRegexUpdated);
     return () => {
-      window.removeEventListener('scroll', onScroll);
       window.removeEventListener('doubletrouble:regex-updated', onRegexUpdated);
     };
   }, []);
@@ -1158,7 +1193,7 @@ export default function App() {
       return;
     }
     Array.from(settingsHost.children).forEach((child) => {
-      if (!(child instanceof HTMLElement)) {
+      if (!(child instanceof HTMLElement) || child.dataset.dtKeepVisible === 'true') {
         return;
       }
       child.hidden = !extensionSettingsOpen || child.dataset.dtExtensionOwner !== extensionSettingsTarget;
@@ -1572,8 +1607,8 @@ export default function App() {
   };
 
   const actorHeaders = (token = authTokenRef.current || authToken) => ({
-    'X-DoubleTrouble-Actor': authUserRef.current?.username || selectedPersona?.name || 'Player',
-    'X-DoubleTrouble-Session': currentRoomIdRef.current || 'default',
+    'X-DoubleTrouble-Actor': encodeURIComponent(authUserRef.current?.username || selectedPersona?.name || 'Player'),
+    'X-DoubleTrouble-Session': encodeURIComponent(currentRoomIdRef.current || 'default'),
     ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   });
@@ -1767,15 +1802,20 @@ export default function App() {
     } catch {
       return;
     }
+    if (!Object.keys(parsed).length) {
+      return;
+    }
     const name = presetNameDraft.trim() || selectedPresetName || 'unsaved';
     const signature = `${selectedPresetType}:${name}:${draft}`;
     if (activePresetDraftSignatureRef.current === signature) {
       return;
     }
     activePresetDraftSignatureRef.current = signature;
+    lastLocalSettingsSaveRef.current.presets = Date.now();
+    lastLocalSettingsSaveRef.current.generation = Date.now();
     const response = await fetch(`/api/presets/${encodeURIComponent(selectedPresetType)}/active-draft`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ...actorHeaders() },
+      headers: { 'Content-Type': 'application/json', ...actorHeaders(token) },
       body: JSON.stringify({ name, preset: parsed }),
     });
     if (!response.ok) {
@@ -1784,12 +1824,13 @@ export default function App() {
       return;
     }
     const data = await response.json() as { active: Record<string, string>; settings: Partial<GenerationSettings> };
+    lastLocalSettingsSaveRef.current.presets = Date.now();
+    lastLocalSettingsSaveRef.current.generation = Date.now();
     setActivePresets(data.active);
-    setGenerationSettings((current) => ({ ...current, ...data.settings, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false }));
   };
 
   useEffect(() => {
-    const timer = window.setTimeout(() => { void syncActivePresetDraft(); }, 450);
+    const timer = window.setTimeout(() => { void syncActivePresetDraft(); }, 550);
     return () => window.clearTimeout(timer);
   }, [presetJsonDraft, presetNameDraft, selectedPresetName, selectedPresetType, authToken, accessDenied.presets]);
 
@@ -1801,24 +1842,40 @@ export default function App() {
     if (generationSettingsSaveSignatureRef.current === signature) {
       return;
     }
+    const snapshot = generationSettings;
     const timer = window.setTimeout(async () => {
+      generationSettingsSaveSignatureRef.current = signature;
+      lastLocalSettingsSaveRef.current.generation = Date.now();
       const response = await fetch('/api/generation/settings', {
         method: 'PUT',
         headers: authJsonHeaders(),
-        body: JSON.stringify(generationSettings),
+        body: JSON.stringify(snapshot),
       });
       if (!response.ok) {
+        generationSettingsSaveSignatureRef.current = '';
         setConnectionMessage(t('connection.error.apply'));
         return;
       }
       const data = await response.json() as Partial<GenerationSettings>;
-      const nextSettings = { ...generationSettings, ...data, api_key: '', clear_api_key: false, proxy_password: '', clear_proxy_password: false };
-      generationSettingsSaveSignatureRef.current = JSON.stringify(nextSettings);
-      setGenerationSettings(nextSettings);
+      lastLocalSettingsSaveRef.current.generation = Date.now();
+      if (snapshot.api_key || snapshot.clear_api_key || snapshot.proxy_password || snapshot.clear_proxy_password) {
+        setGenerationSettings((current) => {
+          const updated = {
+            ...current,
+            api_key_configured: data.api_key_configured ?? current.api_key_configured,
+            proxy_password_configured: data.proxy_password_configured ?? current.proxy_password_configured,
+            api_key: '',
+            clear_api_key: false,
+            proxy_password: '',
+            clear_proxy_password: false,
+          };
+          generationSettingsSaveSignatureRef.current = JSON.stringify(updated);
+          return updated;
+        });
+      }
     }, 650);
     return () => window.clearTimeout(timer);
   }, [generationSettings]);
-
   const saveExtensionMessageByIndex = async (index: number, content: string, expectedMessageId?: string) => {
     const chat = activeChatRef.current;
     const card = activeCardRef.current;
@@ -2433,6 +2490,10 @@ export default function App() {
     void loadRooms();
   };
   const refreshSharedSettings = async (section = '') => {
+    const now = Date.now();
+    if (section && now - (lastLocalSettingsSaveRef.current[section] || 0) < 3500) {
+      return;
+    }
     if (section === 'cards' || section === 'personas' || section === 'library') {
       await refreshLibrary();
       return;
@@ -3828,114 +3889,158 @@ export default function App() {
       data-background-vignette={String(visualSettings.backgroundVignette)}
       data-topbar-visible={String(topbarVisible)}
     >
-      <header className={`${topbarVisible ? 'topbar topbar-visible' : 'topbar topbar-hidden'}${mobileTopbarCollapsed ? ' topbar-collapsed' : ''}`} onClick={toggleMobileTopbar}>
-        <button className="menu-trigger" type="button" onClick={() => setMenuOpen(true)}>
-          <Icon name="menu" />
-          {t('topbar.menu')}
-        </button>
-        <div className="turn-strip app-status-strip">
-          <div>
-            <span>{t('topbar.persona')}</span>
-            <strong>{selectedPersona?.name || t('topbar.persona.none')}</strong>
-          </div>
-          <div>
-            <span>{t('topbar.activeChat')}</span>
-            <strong>{activeCard?.name || t('topbar.activeChat.noCard')} · {activeChat?.title || t('topbar.activeChat.noChat')}</strong>
-          </div>
-          <div>
-            <span>{t('topbar.connections')}</span>
-            <div className="connections-status">
+      <header className="topbar">
+        <div className="topbar-left">
+          <button
+            type="button"
+            className="topbar-chat-pill"
+            onClick={() => {
+              if (activeCard) {
+                setChatPickerOpen((open) => !open);
+              } else {
+                setActiveSection('cards');
+                setMenuOpen(true);
+              }
+            }}
+            title="Сменить чат или карточку персонажа"
+          >
+            {activeCard?.image_url ? (
+              <img src={imageSrc(activeCard.image_url)} alt="" className="topbar-mini-avatar" />
+            ) : (
+              <i className="topbar-mini-avatar">{activeCard?.name?.slice(0, 1) || '✦'}</i>
+            )}
+            <strong>{activeCard?.name || t('topbar.activeChat.noCard')}</strong>
+            <span className="topbar-sep">/</span>
+            <small>{activeChat?.title || t('topbar.activeChat.noChat')}</small>
+          </button>
+        </div>
+
+        <nav className="topbar-quick-nav" aria-label={t('topbar.menu')}>
+          {getMenuSections(t).map((item) => {
+            const isActive = menuOpen && activeSection === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={isActive ? 'topbar-icon-btn active' : 'topbar-icon-btn'}
+                title={`${item.label} — ${item.description}`}
+                aria-label={item.label}
+                onClick={() => {
+                  if (isActive) {
+                    setMenuOpen(false);
+                  } else {
+                    setActiveSection(item.id);
+                    setMenuOpen(true);
+                  }
+                }}
+              >
+                <Icon name={item.icon} />
+                <span className="topbar-icon-label">{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="topbar-right">
+          <button
+            type="button"
+            className="topbar-persona-pill"
+            onClick={() => {
+              setActiveSection('personas');
+              setMenuOpen(true);
+            }}
+            title={t('topbar.persona')}
+          >
+            <Icon name="user" />
+            <span>{selectedPersona?.name || t('topbar.persona.none')}</span>
+          </button>
+          <div className="connections-status">
+            <button
+              className={playersMenuOpen ? 'ghost-button topbar-room-btn active' : 'ghost-button topbar-room-btn'}
+              type="button"
+              onClick={() => {
+                setPlayersMenuOpen((open) => !open);
+                void loadRooms();
+              }}
+            >
+              <span className="online-dot" />
               <strong>{connectedCount}</strong>
-              <button className="ghost-button" type="button" onClick={() => { setPlayersMenuOpen((open) => !open); void loadRooms(); }}>{t('topbar.players')}</button>
-              {playersMenuOpen ? (
-                <div className="players-popover">
-                  <div className="popover-section-title">Онлайн в комнате ({currentRoomId})</div>
-                  <div className="players-pill-list">
-                    {connectedPlayers.length ? connectedPlayers.map((player) => (
-                      <span className="player-pill" key={player.id} title={player.persona_name || player.name}>
-                        {player.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(player.avatar_url), title: player.persona_name || player.name })}><img src={imageSrc(player.avatar_url)} alt="" loading="lazy" /></button> : <i>{(player.persona_name || player.name).slice(0, 1) || '?'}</i>}
-                        <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.name}</span></strong>
-                        {player.username ? <small className="hover-username">({player.username})</small> : null}
-                      </span>
-                    )) : <strong>{t('topbar.players.none')}</strong>}
-                  </div>
-                  <div className="popover-divider" />
-                  <div className="popover-section-title">Режим очереди ходов</div>
-                  <div className="popover-segmented">
-                    <button
-                      type="button"
-                      className={turnMode === 'free' ? 'ghost-button active' : 'ghost-button'}
-                      onClick={() => sendRealtimeEvent({ type: 'turn.mode', turn_mode: 'free' })}
-                    >
-                      Свободный
-                    </button>
-                    <button
-                      type="button"
-                      className={turnMode === 'round_ready' ? 'ghost-button active' : 'ghost-button'}
-                      onClick={() => sendRealtimeEvent({ type: 'turn.mode', turn_mode: 'round_ready' })}
-                    >
-                      Все готовы (Раунд)
-                    </button>
-                  </div>
-                  <div className="popover-divider" />
-                  <label className="popover-checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(activeChat?.party_hud?.enabled)}
-                      disabled={!activeChat}
-                      onChange={(event) => void togglePartyHudEnabled(event.target.checked)}
-                    />
-                    <span>Показывать Party HUD (панель группы)</span>
-                  </label>
+              <small className="room-tag">#{currentRoomId}</small>
+              <span>{t('topbar.players')} ▾</span>
+            </button>
+            {playersMenuOpen ? (
+              <div className="players-popover">
+                <div className="popover-section-title">Онлайн в комнате ({currentRoomId})</div>
+                <div className="players-pill-list">
+                  {connectedPlayers.length ? connectedPlayers.map((player) => (
+                    <span className="player-pill" key={player.id} title={player.persona_name || player.name}>
+                      {player.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(player.avatar_url), title: player.persona_name || player.name })}><img src={imageSrc(player.avatar_url)} alt="" loading="lazy" /></button> : <i>{(player.persona_name || player.name).slice(0, 1) || '?'}</i>}
+                      <strong className="identity-name">{player.is_admin ? <span className="admin-crown">♛</span> : null}<span>{player.persona_name || player.name}</span></strong>
+                      {player.username ? <small className="hover-username">({player.username})</small> : null}
+                    </span>
+                  )) : <strong>{t('topbar.players.none')}</strong>}
+                </div>
+                <div className="popover-divider" />
+                <div className="popover-section-title">Режим очереди ходов</div>
+                <div className="popover-segmented">
                   <button
                     type="button"
-                    className="ghost-button popover-full-btn"
-                    onClick={() => { setMemoryModalOpen(true); setPlayersMenuOpen(false); void loadSummaryMemorySettings(); }}
+                    className={turnMode === 'free' ? 'ghost-button active' : 'ghost-button'}
+                    onClick={() => sendRealtimeEvent({ type: 'turn.mode', turn_mode: 'free' })}
                   >
-                    📜 Память и Авто-саммари ({summaryMemorySettings.enabled ? 'Вкл' : 'Выкл'})
+                    Свободный
                   </button>
-                  <div className="popover-divider" />
-                  <div className="popover-section-title">Комнаты (Multi-Room)</div>
-                  <div className="rooms-list-mini">
-                    {roomsList.map((room) => (
-                      <button
-                        key={room.id}
-                        type="button"
-                        className={room.id === currentRoomId ? 'ghost-button active' : 'ghost-button'}
-                        onClick={() => switchRoom(room.id)}
-                      >
-                        {room.id} ({room.online_count})
-                      </button>
-                    ))}
-                  </div>
-                  <div className="room-switch-row">
-                    <input
-                      type="text"
-                      placeholder="Код новой комнаты…"
-                      value={roomInputDraft}
-                      onChange={(event) => setRoomInputDraft(event.target.value)}
-                    />
-                    <button type="button" className="ghost-button" onClick={() => roomInputDraft.trim() && switchRoom(roomInputDraft.trim())}>Войти</button>
-                  </div>
+                  <button
+                    type="button"
+                    className={turnMode === 'round_ready' ? 'ghost-button active' : 'ghost-button'}
+                    onClick={() => sendRealtimeEvent({ type: 'turn.mode', turn_mode: 'round_ready' })}
+                  >
+                    Все готовы (Раунд)
+                  </button>
                 </div>
-              ) : null}
-            </div>
+                <div className="popover-divider" />
+                <label className="popover-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(activeChat?.party_hud?.enabled)}
+                    disabled={!activeChat}
+                    onChange={(event) => void togglePartyHudEnabled(event.target.checked)}
+                  />
+                  <span>Показывать Party HUD (панель группы)</span>
+                </label>
+                <button
+                  type="button"
+                  className="ghost-button popover-full-btn"
+                  onClick={() => { setMemoryModalOpen(true); setPlayersMenuOpen(false); void loadSummaryMemorySettings(); }}
+                >
+                  📜 Память и Авто-саммари ({summaryMemorySettings.enabled ? 'Вкл' : 'Выкл'})
+                </button>
+                <div className="popover-divider" />
+                <div className="popover-section-title">Комнаты (Multi-Room)</div>
+                <div className="rooms-list-mini">
+                  {roomsList.map((room) => (
+                    <button
+                      key={room.id}
+                      type="button"
+                      className={room.id === currentRoomId ? 'ghost-button active' : 'ghost-button'}
+                      onClick={() => switchRoom(room.id)}
+                    >
+                      {room.id} ({room.online_count})
+                    </button>
+                  ))}
+                </div>
+                <div className="room-switch-row">
+                  <input
+                    type="text"
+                    placeholder="Код новой комнаты…"
+                    value={roomInputDraft}
+                    onChange={(event) => setRoomInputDraft(event.target.value)}
+                  />
+                  <button type="button" className="ghost-button" onClick={() => roomInputDraft.trim() && switchRoom(roomInputDraft.trim())}>Войти</button>
+                </div>
+              </div>
+            ) : null}
           </div>
-        </div>
-        <div className="brand-block">
-          <div>
-            <strong>DoubleTrouble</strong>
-            <small>room: {currentRoomId} · {window.location.host}</small>
-          </div>
-          <img className="brand-mark" src="/favicon.png" alt="DT" />
-          <button
-            className="ghost-button topbar-collapse-button"
-            type="button"
-            aria-label={mobileTopbarCollapsed ? 'Развернуть панель' : 'Свернуть панель'}
-            onClick={() => setMobileTopbarCollapsed((collapsed) => !collapsed)}
-          >
-            {mobileTopbarCollapsed ? '▾' : '▴'}
-          </button>
         </div>
       </header>
 
@@ -4033,7 +4138,8 @@ export default function App() {
               const displayContent = isSecretHiddenForMe
                 ? `🕵️ *${message.author} совершает тайное действие (известно только мастеру ИИ)…*`
                 : (message.display_text || message.content);
-              const visibleMessageContent = generationReplaceMessageId === message.id && generationStreamText ? generationStreamText : displayContent;
+              const activeStreamSlice = displayedStreamText || generationStreamText;
+              const visibleMessageContent = generationReplaceMessageId === message.id && activeStreamSlice ? `${activeStreamSlice}▍` : displayContent;
               const rollPrompts = message.role === 'assistant'
                 ? Array.from(visibleMessageContent.matchAll(/\[ROLL:\s*([^\]]+)\]/gi)).map((m) => m[1].trim())
                 : [];
@@ -4072,8 +4178,6 @@ export default function App() {
               >
                 <div className="message-avatar-rail">
                   {message.avatar_url ? <button className="avatar-preview-button" type="button" onClick={() => setImagePreview({ src: imageSrc(message.avatar_url), title: message.author })}><img src={imageSrc(message.avatar_url)} alt="" loading="lazy" /></button> : <i>{message.author.slice(0, 1) || '?'}</i>}
-                  <small className="message-index">#{messageIndex}</small>
-                  <small className="message-token-count">{approxTokens(visibleMessageContent)} {t('message.tokens')}</small>
                 </div>
                 <div className="message-actions extraMesButtons" aria-label={t('message.actions')}>
                   {canSwipe ? <button className="mes_button" type="button" title={t('message.swipe.prev')} onClick={() => void swipeBotMessage(message, -1)}>‹</button> : null}
@@ -4102,8 +4206,9 @@ export default function App() {
                     <span className="message-name-block">
                       <strong className="identity-name">{message.is_admin ? <span className="admin-crown">♛</span> : null}<span>{message.author}</span></strong>
                       <small className="message-time">{formatChatMessageTime(message.created_at)}</small>
+                      <small className="message-meta-inline">#{messageIndex}</small>
                       {message.username ? <small className="hover-username">({message.username})</small> : null}
-                      {message.is_ooc ? <span className="msg-mode-badge ooc-badge">💬 OOC · вне игры</span> : null}
+                      {message.is_ooc ? <span className="msg-mode-badge ooc-badge">💬 OOC</span> : null}
                       {message.is_secret ? (
                         <span className="msg-mode-badge secret-badge">
                           🕵️ {message.secret_revealed ? 'Тайный ход (раскрыт)' : 'Тайный ход'}
@@ -4163,7 +4268,7 @@ export default function App() {
                   <header>
                     <span className="message-name-block"><strong className="identity-name"><span>{activeCard?.name || t('composer.bot')}</span></strong></span>
                   </header>
-                  {generationStreamText ? <MessageContent content={generationStreamText} reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
+                  {(displayedStreamText || generationStreamText) ? <MessageContent content={`${displayedStreamText || generationStreamText}▍`} reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
                 </div>
               </article>
             ) : null}
@@ -4178,96 +4283,69 @@ export default function App() {
               ↓
             </button>
           ) : null}
-          <div className="multiplayer-status-bar">
-            <div className="composer-mode-pills">
-              <button
-                type="button"
-                className={composerMode === 'normal' ? 'mode-pill active' : 'mode-pill'}
-                onClick={() => setComposerMode('normal')}
-                title="Обычное игровое сообщение"
-              >
-                ✍️ В игру
-              </button>
-              <button
-                type="button"
-                className={composerMode === 'ooc' ? 'mode-pill ooc active' : 'mode-pill ooc'}
-                onClick={() => setComposerMode((m) => (m === 'ooc' ? 'normal' : 'ooc'))}
-                title="Внеигровой комментарий (виден друзьям, скрыт от ИИ)"
-              >
-                💬 OOC
-              </button>
-              <button
-                type="button"
-                className={composerMode === 'secret' ? 'mode-pill secret active' : 'mode-pill secret'}
-                onClick={() => setComposerMode((m) => (m === 'secret' ? 'normal' : 'secret'))}
-                title="Тайный ход (виден только вам и мастеру ИИ, пока не раскроете)"
-              >
-                🕵️ Тайный ход
-              </button>
-              <button
-                type="button"
-                className="mode-pill dice"
-                disabled={!activeChat || isGenerating}
-                onClick={() => void rollDiceInChat('1d20')}
-                title="Быстрый бросок 1d20 (или введите /roll 2d6+3)"
-              >
-                🎲 1d20
-              </button>
-              <button
-                type="button"
-                className={summaryMemorySettings.enabled ? 'mode-pill memory active' : 'mode-pill memory'}
-                onClick={() => { setMemoryModalOpen(true); void loadSummaryMemorySettings(); }}
-                title="Настройки памяти чата и авто-саммари"
-              >
-                📜 Память{summaryMemorySettings.enabled ? ' ✓' : ''}
-              </button>
-            </div>
-            {Object.keys(typingPlayers).length > 0 ? (
-              <span className="typing-indicator-pill">
-                <span className="thinking-dots"><i /><i /><i /></span>
-                <strong>{Object.values(typingPlayers).join(', ')}</strong> печатает…
-              </span>
-            ) : null}
-            {connectedPlayers.length > 1 ? (() => {
-              const turnPlayer = connectedPlayers.find((p) => p.id === currentTurnParticipantId) || connectedPlayers[0];
-              const isMyTurn = turnPlayer?.id === participantIdRef.current;
-              const amIReady = readyParticipantIds.includes(participantIdRef.current);
-              return (
-                <span className={isMyTurn ? 'turn-indicator-pill my-turn' : 'turn-indicator-pill'}>
-                  <span>{isMyTurn ? 'Ваш ход:' : 'Ход:'}</span>
-                  <strong>{turnPlayer?.persona_name || turnPlayer?.name || 'Player'}</strong>
-                  {isMyTurn ? (
-                    <button
-                      type="button"
-                      className="ghost-button pass-turn-button"
-                      onClick={() => sendRealtimeEvent({ type: 'turn.pass', participant_id: participantIdRef.current, card_id: activeCard?.id, chat_id: activeChat?.id })}
-                    >
-                      Передать ход →
-                    </button>
-                  ) : null}
-                  {turnMode === 'round_ready' ? (
-                    <button
-                      type="button"
-                      className={amIReady ? 'ghost-button pass-turn-button ready-active' : 'ghost-button pass-turn-button'}
-                      onClick={() => sendRealtimeEvent({ type: 'turn.ready', participant_id: participantIdRef.current, ready: !amIReady, card_id: activeCard?.id, chat_id: activeChat?.id })}
-                      title="Когда все игроки в комнате готовы или отправили сообщение, бот ответит автоматически"
-                    >
-                      {amIReady ? `✓ Готов (${readyParticipantIds.length}/${connectedPlayers.length})` : `Готов? (${readyParticipantIds.length}/${connectedPlayers.length})`}
-                    </button>
-                  ) : null}
+          <div className="composer-dock">
+          {(composerMode !== 'normal' || Object.keys(typingPlayers).length > 0 || connectedPlayers.length > 1) ? (
+            <div className="multiplayer-status-bar">
+              {composerMode !== 'normal' ? (
+                <button
+                  type="button"
+                  className="mode-pill active"
+                  onClick={() => setComposerMode('normal')}
+                  title="Нажмите, чтобы вернуться в обычный режим"
+                >
+                  {composerMode === 'ooc' ? '💬 Режим OOC (вне игры) ✕' : '🕵️ Тайный ход (скрыто от других) ✕'}
+                </button>
+              ) : null}
+              {Object.keys(typingPlayers).length > 0 ? (
+                <span className="typing-indicator-pill">
+                  <span className="thinking-dots"><i /><i /><i /></span>
+                  <strong>{Object.values(typingPlayers).join(', ')}</strong> печатает…
                 </span>
-              );
-            })() : null}
-          </div>
+              ) : null}
+              {connectedPlayers.length > 1 ? (() => {
+                const turnPlayer = connectedPlayers.find((p) => p.id === currentTurnParticipantId) || connectedPlayers[0];
+                const isMyTurn = turnPlayer?.id === participantIdRef.current;
+                const amIReady = readyParticipantIds.includes(participantIdRef.current);
+                return (
+                  <span className={isMyTurn ? 'turn-indicator-pill my-turn' : 'turn-indicator-pill'}>
+                    <span>{isMyTurn ? 'Ваш ход:' : 'Ход:'}</span>
+                    <strong>{turnPlayer?.persona_name || turnPlayer?.name || 'Player'}</strong>
+                    {isMyTurn ? (
+                      <button
+                        type="button"
+                        className="ghost-button pass-turn-button"
+                        onClick={() => sendRealtimeEvent({ type: 'turn.pass', participant_id: participantIdRef.current, card_id: activeCard?.id, chat_id: activeChat?.id })}
+                      >
+                        Передать →
+                      </button>
+                    ) : null}
+                    {turnMode === 'round_ready' ? (
+                      <button
+                        type="button"
+                        className={amIReady ? 'ghost-button pass-turn-button ready-active' : 'ghost-button pass-turn-button'}
+                        onClick={() => sendRealtimeEvent({ type: 'turn.ready', participant_id: participantIdRef.current, ready: !amIReady, card_id: activeCard?.id, chat_id: activeChat?.id })}
+                      >
+                        {amIReady ? `✓ Готов (${readyParticipantIds.length}/${connectedPlayers.length})` : `Готов? (${readyParticipantIds.length}/${connectedPlayers.length})`}
+                      </button>
+                    ) : null}
+                  </span>
+                );
+              })() : null}
+            </div>
+          ) : null}
 
           <form id="send_form" className="composer" onSubmit={(event) => { event.preventDefault(); void sendChatMessage(); }}>
-            <button className="composer-menu-button" type="button" aria-label={t('composer.actions')} onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
+            <button className="composer-menu-button" type="button" aria-label={t('composer.actions')} title="Действия чата, бросок кубика, режимы OOC/Тайно" onClick={() => setComposerMenuOpen(!composerMenuOpen)}>+</button>
             {composerMenuOpen ? (
               <ComposerActionMenu
                 activeChat={activeChat}
                 isGenerating={isGenerating}
+                composerMode={composerMode}
+                setComposerMode={(m) => { setComposerMode(m); setComposerMenuOpen(false); }}
+                rollDice={() => { setComposerMenuOpen(false); void rollDiceInChat('1d20'); }}
+                openMemory={() => { setComposerMenuOpen(false); setMemoryModalOpen(true); void loadSummaryMemorySettings(); }}
                 openChats={() => { setChatPickerOpen((open) => !open); setComposerMenuOpen(false); }}
-                rerollLastBotMessage={rerollLastBotMessage}
+                rerollLastBotMessage={() => { setComposerMenuOpen(false); return rerollLastBotMessage(); }}
               />
             ) : null}
             {chatPickerOpen ? (
@@ -4343,6 +4421,7 @@ export default function App() {
               )}
             </div>
           </form>
+          </div>
         </section>
 
       </section>
@@ -4520,8 +4599,12 @@ export default function App() {
         className={`extension-settings-host ${menuOpen && activeSection === 'extensions' && extensionSettingsOpen ? 'extension-settings-host-visible' : ''}`}
         aria-hidden={menuOpen && activeSection === 'extensions' && extensionSettingsOpen ? 'false' : 'true'}
         data-active-extension={extensionSettingsTarget}
-      />
-
+      >
+        <div className="extension-host-header" data-dt-keep-visible="true">
+          <strong>Настройки: {extensionSettingsTarget}</strong>
+          <button type="button" className="ghost-button" onClick={() => { setExtensionSettingsOpen(false); setExtensionSettingsTarget(''); }}>✕ Закрыть</button>
+        </div>
+      </section>
       {menuOpen ? (
         <MenuOverlay
           activeSection={activeSection}
@@ -4941,12 +5024,10 @@ function MenuOverlay({
                 key={item.id}
                 type="button"
                 onClick={() => setActiveSection(item.id)}
+                title={item.description}
               >
                 <Icon name={item.icon} />
-                <span>
-                  <strong>{item.label}</strong>
-                  <small>{item.description}</small>
-                </span>
+                <strong>{item.label}</strong>
               </button>
             ))}
             <LanguageSelector language={language} setLanguage={setLanguage} />
@@ -5149,6 +5230,7 @@ function KeyManager({ mode = 'panel' }: { mode?: 'panel' | 'popover' }) {
     const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
     const accessToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
     return {
+      'X-DoubleTrouble-Actor': 'Player',
       ...(json ? { 'Content-Type': 'application/json' } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(accessToken ? { 'X-DoubleTrouble-Access': accessToken } : {}),
@@ -5585,7 +5667,7 @@ function ExtensionsManager() {
       if (noriMynExtension) {
         setBuiltInSettings((current) => {
           const nextSettings = { ...current, noriMynInfoblock: noriMynExtension.enabled };
-          window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+          saveBuiltInExtensionSettings(nextSettings);
           return nextSettings;
         });
       }
@@ -5593,7 +5675,7 @@ function ExtensionsManager() {
       if (magicTranslationExtension) {
         setBuiltInSettings((current) => {
           const nextSettings = { ...current, magicTranslation: magicTranslationExtension.enabled };
-          window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+          saveBuiltInExtensionSettings(nextSettings);
           return nextSettings;
         });
       }
@@ -5644,7 +5726,7 @@ function ExtensionsManager() {
     }
     const nextSettings = { ...builtInSettings, noriMynInfoblock: enabled };
     setBuiltInSettings(nextSettings);
-    window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+    saveBuiltInExtensionSettings(nextSettings);
     setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.newMessagesApply')}`);
   };
 
@@ -5654,7 +5736,7 @@ function ExtensionsManager() {
     }
     const nextSettings = { ...builtInSettings, magicTranslation: enabled };
     setBuiltInSettings(nextSettings);
-    window.localStorage.setItem(BUILT_IN_EXTENSIONS_STORAGE_KEY, JSON.stringify(nextSettings));
+    saveBuiltInExtensionSettings(nextSettings);
     setMessage(`${enabled ? t('common.enabled') : t('common.disabled')}. ${t('extensions.newMessagesApply')}`);
   };
 
@@ -6761,8 +6843,8 @@ function SettingsSection({
         })()}
         <EditableTextArea label={t('connection.systemPrompt')} value={generationSettings.system_prompt} onChange={(system_prompt) => setGenerationSettings({ ...generationSettings, system_prompt })} />
         <TwoColumns
-          left={<EditableField label={t('connection.temperature')} value={String(generationSettings.temperature)} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
-          right={<EditableField label={t('connection.maxTokens')} value={String(generationSettings.max_tokens)} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
+          left={<NumberInputField label={t('connection.temperature')} value={generationSettings.temperature} fallback={0.8} min={0} max={2} step={0.05} onChange={(temperature) => setGenerationSettings({ ...generationSettings, temperature: Number(temperature) || 0 })} />}
+          right={<NumberInputField label={t('connection.maxTokens')} value={generationSettings.max_tokens} fallback={350} min={1} max={128000} step={50} onChange={(maxTokens) => setGenerationSettings({ ...generationSettings, max_tokens: Number(maxTokens) || 1 })} />}
         />
       </div>
     );
@@ -7441,12 +7523,34 @@ function ChatPicker({
   );
 }
 
-function ComposerActionMenu({ activeChat, isGenerating, openChats, rerollLastBotMessage }: { activeChat: BotChat | null; isGenerating: boolean; openChats: () => void; rerollLastBotMessage: () => Promise<void> }) {
+function ComposerActionMenu({
+  activeChat,
+  isGenerating,
+  composerMode,
+  setComposerMode,
+  rollDice,
+  openMemory,
+  openChats,
+  rerollLastBotMessage,
+}: {
+  activeChat: BotChat | null;
+  isGenerating: boolean;
+  composerMode: 'normal' | 'ooc' | 'secret';
+  setComposerMode: (mode: 'normal' | 'ooc' | 'secret') => void;
+  rollDice: () => void;
+  openMemory: () => void;
+  openChats: () => void;
+  rerollLastBotMessage: () => Promise<void>;
+}) {
   const { t } = useLocaleContext();
   return (
     <div className="composer-action-menu">
-      <button type="button" onClick={openChats}>{t('composer.chats')}</button>
-      <button type="button" disabled={!activeChat || isGenerating} onClick={() => void rerollLastBotMessage()}>{t('message.reroll')}</button>
+      <button type="button" onClick={openChats}>🗂️ {t('composer.chats')}</button>
+      <button type="button" disabled={!activeChat || isGenerating} onClick={() => void rerollLastBotMessage()}>↻ {t('message.reroll')}</button>
+      <button type="button" disabled={!activeChat || isGenerating} onClick={rollDice}>🎲 Бросить кубик (1d20)</button>
+      <button type="button" className={composerMode === 'ooc' ? 'active' : ''} onClick={() => setComposerMode(composerMode === 'ooc' ? 'normal' : 'ooc')}>💬 Режим OOC (вне игры)</button>
+      <button type="button" className={composerMode === 'secret' ? 'active' : ''} onClick={() => setComposerMode(composerMode === 'secret' ? 'normal' : 'secret')}>🕵️ Тайный ход (скрыто)</button>
+      <button type="button" onClick={openMemory}>📜 Память чата (Саммари)</button>
     </div>
   );
 }
@@ -7493,7 +7597,7 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
   );
 }
 
-function MessageContent({ content, reasoning, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; reasoning: ReasoningDisplaySettings; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
+const MessageContent = memo(function MessageContent({ content, reasoning, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; reasoning: ReasoningDisplaySettings; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
   const { t } = useLocaleContext();
   const regexedContent = getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
   const parsed = reasoning.autoParse ? splitReasoning(regexedContent, reasoning) : { reasoning: '', visible: regexedContent, complete: false };
@@ -7509,10 +7613,10 @@ function MessageContent({ content, reasoning, imagePending = false, renderPendin
         </details>
       ) : null}
       {reasoningText && reasoning.showHidden ? <pre className="reasoning-visible">{reasoningText}</pre> : null}
-      {formatMessageText(parsed.visible, formatOptions)}
+      {formatMessageText(parsed.visible, formatOptions, true)}
     </div>
   );
-}
+});
 
 function formatChatMessageTime(value: string) {
   const date = new Date(value);
@@ -7578,8 +7682,8 @@ function findReasoningMarker(content: string, markers: string[], fromIndex: numb
   }, { index: -1, marker: '' });
 }
 
-function formatMessageText(content: string, options: ExtensionMessageFormatOptions = {}): ReactNode {
-  const regexedContent = getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
+function formatMessageText(content: string, options: ExtensionMessageFormatOptions = {}, alreadyRegexed = false): ReactNode {
+  const regexedContent = alreadyRegexed ? content : getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
   if (loadBuiltInExtensionSettings().noriMynInfoblock && /◈NORICORE◈/i.test(regexedContent)) {
     return formatNoricoreMessageText(regexedContent, options);
   }

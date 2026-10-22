@@ -75,7 +75,7 @@ class SecurityPermissions(BaseModel):
     manage_presets: PermissionRule = Field(default_factory=PermissionRule)
     manage_lorebooks: PermissionRule = Field(default_factory=PermissionRule)
     manage_extensions: PermissionRule = Field(default_factory=PermissionRule)
-    manage_keys: PermissionRule = Field(default_factory=lambda: PermissionRule(mode="admins"))
+    manage_keys: PermissionRule = Field(default_factory=lambda: PermissionRule(mode="everyone"))
     manage_security: PermissionRule = Field(default_factory=lambda: PermissionRule(mode="admins"))
 
 
@@ -120,7 +120,9 @@ class UserSettings(BaseModel):
     generation_presets: list[GenerationConnectionPreset] = Field(default_factory=list)
     active_generation_preset: str = ""
     active_presets: dict[str, str] = Field(default_factory=dict)
-    auth_required: bool = False
+    auth_required: bool = Field(
+        default_factory=lambda: os.environ.get("DOUBLE_TROUBLE_AUTH_REQUIRED", os.environ.get("DOUBLE_TROUBLE_ALLOW_EXTERNAL", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    )
     registration_allowed: bool = True
     bot_reply_allowed: bool = True
     access_password_required: bool = False
@@ -448,13 +450,20 @@ class SettingsService:
         return self.settings.generation
 
     def _load_settings(self) -> UserSettings:
+        env_auth = os.environ.get("DOUBLE_TROUBLE_AUTH_REQUIRED", os.environ.get("DOUBLE_TROUBLE_ALLOW_EXTERNAL", "")).strip().lower() in {"1", "true", "yes", "on"}
         if not self.settings_path.exists():
-            return UserSettings()
+            settings = UserSettings()
+            if env_auth:
+                settings.auth_required = True
+            return settings
 
         with self.settings_path.open("r", encoding="utf-8") as settings_file:
             raw_settings = yaml.safe_load(settings_file) or {}
-        return UserSettings.model_validate(raw_settings)
-
+        settings = UserSettings.model_validate(raw_settings)
+        users_path = self.settings_path.parent / "users.yaml"
+        if env_auth and not users_path.exists():
+            settings.auth_required = True
+        return settings
     def _save_settings(self) -> None:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.settings_path.with_suffix(".yaml.tmp")

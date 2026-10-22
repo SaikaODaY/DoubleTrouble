@@ -16,10 +16,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DOUBLE_TROUBLE_HOST=0.0.0.0 \
     DOUBLE_TROUBLE_PORT=8017 \
     DOUBLE_TROUBLE_ALLOW_EXTERNAL=true \
+    DOUBLE_TROUBLE_AUTH_REQUIRED=true \
     DOUBLE_TROUBLE_OPEN_BROWSER=false \
     DOUBLE_TROUBLE_DATA_ROOT=/data \
     DOUBLE_TROUBLE_CONFIG_PATH=/data/config.yaml
-
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
@@ -29,7 +29,7 @@ COPY presets/ /app/presets/
 COPY run.py /app/run.py
 COPY --from=frontend-builder /build/frontend/dist /app/frontend/dist
 
-RUN mkdir -p /data
+RUN mkdir -p /data /app/data /app/config
 
 VOLUME ["/data"]
 EXPOSE 8017

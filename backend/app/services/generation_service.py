@@ -171,8 +171,7 @@ class GenerationService:
         return reply
 
     def should_stream_chat_reply(self, openai_preset: dict[str, Any] | None = None) -> bool:
-        return self._bool_from_preset(openai_preset, "stream_openai", False)
-
+        return self._bool_from_preset(openai_preset, "stream_openai", True)
     async def generate_chat_reply_stream(self, character_name: str, history: list[BotChatMessage], openai_preset: dict[str, Any] | None, character_data: dict[str, Any] | None, persona_name: str | None, persona_description: str | None, world_info: dict[str, Any] | None, multi_user_mode: bool, on_update: Callable[[str], Awaitable[None]]) -> str:
         if not self.is_enabled():
             raise RuntimeError("Generation provider is disabled. Configure it in the frontend settings first.")

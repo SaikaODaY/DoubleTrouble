@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   type RegexScript,
@@ -12,6 +12,7 @@ import {
   createEmptyRegexScript,
   exportRegexScript,
   importRegexScript,
+  importRegexScriptsFromJson,
   isScopedScriptsAllowed,
   allowScopedScripts,
   disallowScopedScripts,
@@ -27,7 +28,6 @@ import {
   exportRegexPreset,
   importRegexPreset,
 } from './regexEngine';
-
 const PLACEMENT_LABELS: Record<number, string> = {
   [regex_placement.MD_DISPLAY]: 'Display',
   [regex_placement.USER_INPUT]: 'User Input',
@@ -53,7 +53,6 @@ function ScriptEditor({
   onCancel: () => void;
 }) {
   const [draft, setDraft] = useState<RegexScript>({ ...script });
-  const fileRef = useRef<HTMLInputElement>(null);
 
   const togglePlacement = (value: number) => {
     setDraft((prev) => ({
@@ -61,7 +60,6 @@ function ScriptEditor({
       placement: prev.placement.includes(value) ? prev.placement.filter((p) => p !== value) : [...prev.placement, value],
     }));
   };
-
   return (
     <div className="regex-editor-overlay">
       <div className="regex-editor-panel">
@@ -161,19 +159,24 @@ function ScriptEditor({
           }}>
             Export
           </button>
-          <button type="button" className="ghost-button" onClick={() => fileRef.current?.click()}>
-            Import
-          </button>
-          <input ref={fileRef} type="file" accept=".json" hidden onChange={async (e) => {
-            const file = e.target.files?.[0];
-            if (!file) return;
-            const text = await file.text();
-            const imported = importRegexScript(text);
-            if (imported) {
-              setDraft(imported);
-            }
-            if (e.target) e.target.value = '';
-          }} />
+          <label className="ghost-button" style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', padding: '0.45rem 0.75rem', borderRadius: 'var(--radius-control)' }}>
+            <span>Импорт .json</span>
+            <input
+              type="file"
+              accept=".json,application/json"
+              style={{ display: 'none' }}
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                if (!file) return;
+                const text = await file.text();
+                const imported = importRegexScript(text);
+                if (imported) {
+                  setDraft(imported);
+                }
+              }}
+            />
+          </label>
         </div>
       </div>
     </div>
@@ -255,6 +258,7 @@ export function RegexSettings() {
   const [presetAllowed, setPresetAllowed] = useState(() => isPresetScriptsAllowed());
   const [editingScript, setEditingScript] = useState<RegexScript | null>(null);
   const [editingType, setEditingType] = useState<ScriptType>(SCRIPT_TYPES.GLOBAL);
+  const [statusMessage, setStatusMessage] = useState('');
 
   const refresh = useCallback(() => {
     setGlobalScripts(getScriptsByType(SCRIPT_TYPES.GLOBAL));
@@ -269,6 +273,7 @@ export function RegexSettings() {
     window.addEventListener('doubletrouble:regex-updated', refresh);
     return () => window.removeEventListener('doubletrouble:regex-updated', refresh);
   }, [refresh]);
+
   const save = (type: ScriptType, scripts: RegexScript[]) => {
     saveScriptsByType(scripts, type);
     refresh();
@@ -277,6 +282,37 @@ export function RegexSettings() {
   const addScript = (type: ScriptType) => {
     setEditingType(type);
     setEditingScript(createEmptyRegexScript());
+  };
+
+  const handleImportFiles = async (type: ScriptType, files: FileList | null) => {
+    if (!files || !files.length) return;
+    const current = [...getScriptsByType(type)];
+    let addedCount = 0;
+    for (const file of Array.from(files)) {
+      try {
+        const text = await file.text();
+        const importedList = importRegexScriptsFromJson(text);
+        for (const item of importedList) {
+          const existingIdx = current.findIndex((s) => s.id === item.id);
+          if (existingIdx >= 0) {
+            current[existingIdx] = item;
+          } else {
+            current.push(item);
+          }
+          addedCount += 1;
+        }
+      } catch {
+        // ignore invalid file
+      }
+    }
+    if (addedCount > 0) {
+      if (type === SCRIPT_TYPES.SCOPED) allowScopedScripts();
+      if (type === SCRIPT_TYPES.PRESET) allowPresetScripts();
+      save(type, current);
+      setStatusMessage(`Импортировано скриптов: ${addedCount}`);
+    } else {
+      setStatusMessage('Не удалось распознать JSON регекса в выбранном файле.');
+    }
   };
 
   const handleSaveEditor = (script: RegexScript) => {
@@ -332,14 +368,42 @@ export function RegexSettings() {
         </label>
       </div>
 
-      <ScriptList title="Global Scripts" scripts={globalScripts} type={SCRIPT_TYPES.GLOBAL} onChange={(s) => save(SCRIPT_TYPES.GLOBAL, s)} onEdit={handleEdit} />
+      {statusMessage ? <p className="library-message">{statusMessage}</p> : null}
+
+      <ScriptList title="Global Scripts (Глобальные)" scripts={globalScripts} type={SCRIPT_TYPES.GLOBAL} onChange={(s) => save(SCRIPT_TYPES.GLOBAL, s)} onEdit={handleEdit} />
       <div className="regex-add-row">
-        <button type="button" onClick={() => addScript(SCRIPT_TYPES.GLOBAL)}>Add Global</button>
+        <button type="button" onClick={() => addScript(SCRIPT_TYPES.GLOBAL)}>+ Добавить Global</button>
+        <label className="ghost-button" style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', padding: '0.45rem 0.75rem', borderRadius: 'var(--radius-control)', fontSize: '0.85rem' }}>
+          <span>📂 Импорт регекса (.json)</span>
+          <input
+            type="file"
+            accept=".json,application/json"
+            multiple
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const files = e.target.files;
+              void handleImportFiles(SCRIPT_TYPES.GLOBAL, files).then(() => { e.target.value = ''; });
+            }}
+          />
+        </label>
       </div>
 
-      <ScriptList title="Scoped Scripts (Character)" scripts={scopedScripts} type={SCRIPT_TYPES.SCOPED} onChange={(s) => save(SCRIPT_TYPES.SCOPED, s)} onEdit={handleEdit} />
+      <ScriptList title="Scoped Scripts (Для текущей карточки)" scripts={scopedScripts} type={SCRIPT_TYPES.SCOPED} onChange={(s) => save(SCRIPT_TYPES.SCOPED, s)} onEdit={handleEdit} />
       <div className="regex-add-row">
-        <button type="button" onClick={() => addScript(SCRIPT_TYPES.SCOPED)}>Add Scoped</button>
+        <button type="button" onClick={() => addScript(SCRIPT_TYPES.SCOPED)}>+ Добавить Scoped</button>
+        <label className="ghost-button" style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', padding: '0.45rem 0.75rem', borderRadius: 'var(--radius-control)', fontSize: '0.85rem' }}>
+          <span>📂 Импорт в карточку (.json)</span>
+          <input
+            type="file"
+            accept=".json,application/json"
+            multiple
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const files = e.target.files;
+              void handleImportFiles(SCRIPT_TYPES.SCOPED, files).then(() => { e.target.value = ''; });
+            }}
+          />
+        </label>
         {scopedScripts.map((script) => (
           <button type="button" key={script.id} className="ghost-button tiny-button" onClick={() => moveToType(script, SCRIPT_TYPES.SCOPED, SCRIPT_TYPES.GLOBAL)}>
             Move {script.scriptName || 'Unnamed'} to Global
@@ -347,16 +411,28 @@ export function RegexSettings() {
         ))}
       </div>
 
-      <ScriptList title="Preset Scripts" scripts={presetScripts} type={SCRIPT_TYPES.PRESET} onChange={(s) => save(SCRIPT_TYPES.PRESET, s)} onEdit={handleEdit} />
+      <ScriptList title="Preset Scripts (Для текущего пресета)" scripts={presetScripts} type={SCRIPT_TYPES.PRESET} onChange={(s) => save(SCRIPT_TYPES.PRESET, s)} onEdit={handleEdit} />
       <div className="regex-add-row">
-        <button type="button" onClick={() => addScript(SCRIPT_TYPES.PRESET)}>Add Preset</button>
+        <button type="button" onClick={() => addScript(SCRIPT_TYPES.PRESET)}>+ Добавить Preset</button>
+        <label className="ghost-button" style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', padding: '0.45rem 0.75rem', borderRadius: 'var(--radius-control)', fontSize: '0.85rem' }}>
+          <span>📂 Импорт в пресет (.json)</span>
+          <input
+            type="file"
+            accept=".json,application/json"
+            multiple
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const files = e.target.files;
+              void handleImportFiles(SCRIPT_TYPES.PRESET, files).then(() => { e.target.value = ''; });
+            }}
+          />
+        </label>
         {presetScripts.map((script) => (
           <button type="button" key={script.id} className="ghost-button tiny-button" onClick={() => moveToType(script, SCRIPT_TYPES.PRESET, SCRIPT_TYPES.GLOBAL)}>
             Move {script.scriptName || 'Unnamed'} to Global
           </button>
         ))}
       </div>
-
       {editingScript && (
         <ScriptEditor
           script={editingScript}
@@ -373,7 +449,6 @@ export function RegexSettings() {
 function PresetManager({ onApply }: { onApply: () => void }) {
   const [presets, setPresets] = useState<RegexPreset[]>(() => getRegexPresets());
   const [editingPreset, setEditingPreset] = useState<RegexPreset | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
 
   const refreshPresets = () => setPresets(getRegexPresets());
 
@@ -429,19 +504,27 @@ function PresetManager({ onApply }: { onApply: () => void }) {
       ))}
       <div className="regex-add-row">
         <button type="button" onClick={() => setEditingPreset(createEmptyRegexPreset())}>Save Current as Preset</button>
-        <button type="button" className="ghost-button" onClick={() => fileRef.current?.click()}>Import Preset</button>
-        <input ref={fileRef} type="file" accept=".json" hidden onChange={async (e) => {
-          const file = e.target.files?.[0];
-          if (!file) return;
-          const text = await file.text();
-          const imported = importRegexPreset(text);
-          if (imported) {
-            handleSavePreset(imported);
-          }
-          if (e.target) e.target.value = '';
-        }} />
+        <label className="ghost-button" style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', padding: '0.45rem 0.75rem', borderRadius: 'var(--radius-control)', fontSize: '0.85rem' }}>
+          <span>📂 Import Preset (.json)</span>
+          <input
+            type="file"
+            accept=".json,application/json"
+            style={{ display: 'none' }}
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (!file) return;
+              const text = await file.text();
+              const imported = importRegexPreset(text, file.name.replace(/\.json$/i, ''));
+              if (imported) {
+                handleSavePreset(imported);
+                applyRegexPreset(imported.id);
+                onApply();
+              }
+            }}
+          />
+        </label>
       </div>
-
       {editingPreset && (
         <div className="regex-editor-overlay">
           <div className="regex-editor-panel">

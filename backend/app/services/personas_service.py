@@ -13,6 +13,7 @@ class Persona(BaseModel):
     avatar: str = ""
     avatar_url: str = ""
     active: bool = False
+    owner: str = ""
 
 
 class PersonaCreate(BaseModel):
@@ -31,35 +32,77 @@ class PersonasService:
         self.path = path
         self.avatars_dir = avatars_dir
 
-    def list_personas(self) -> list[Persona]:
+    def list_all_personas(self) -> list[Persona]:
         return self._load()
 
-    def create_persona(self, request: PersonaCreate) -> Persona:
+    def list_personas(self, owner: str = "", is_admin: bool = False) -> list[Persona]:
         personas = self._load()
-        persona = Persona(name=request.name.strip() or "Persona", description=request.description.strip(), avatar=request.avatar.strip())
-        if not personas:
-            persona.active = True
+        clean_owner = owner.strip()
+        if not clean_owner:
+            unowned = [p for p in personas if not p.owner.strip()]
+            return unowned if unowned else personas
+
+        owner_lower = clean_owner.lower()
+        owned = [p for p in personas if p.owner.strip().lower() == owner_lower]
+        if not owned and is_admin:
+            unowned = [p for p in personas if not p.owner.strip()]
+            if unowned:
+                for p in unowned:
+                    p.owner = clean_owner
+                self._save(personas)
+                return unowned
+
+        if not owned:
+            default_persona = Persona(
+                name=clean_owner,
+                description="",
+                owner=clean_owner,
+                active=True,
+            )
+            personas.append(default_persona)
+            self._save(personas)
+            return [default_persona]
+        return owned
+
+    def create_persona(self, request: PersonaCreate, owner: str = "") -> Persona:
+        personas = self._load()
+        clean_owner = owner.strip()
+        owner_lower = clean_owner.lower()
+        user_personas = [
+            p for p in personas
+            if (p.owner.strip().lower() == owner_lower if clean_owner else not p.owner.strip())
+        ]
+        persona = Persona(
+            name=request.name.strip() or "Persona",
+            description=request.description.strip(),
+            avatar=request.avatar.strip(),
+            owner=clean_owner,
+            active=not user_personas,
+        )
         personas.append(persona)
         self._save(personas)
         return persona
 
-    def activate_persona(self, persona_id: str) -> Persona:
+    def activate_persona(self, persona_id: str, owner: str = "") -> Persona:
         personas = self._load()
-        selected: Persona | None = None
-        for persona in personas:
-            persona.active = persona.id == persona_id
-            if persona.active:
-                selected = persona
-        if selected is None:
+        target = next((p for p in personas if p.id == persona_id), None)
+        if target is None:
             raise KeyError(persona_id)
+        scope_owner = (owner.strip() or target.owner.strip()).lower()
+        for persona in personas:
+            if persona.owner.strip().lower() == scope_owner:
+                persona.active = persona.id == persona_id
         self._save(personas)
-        return selected
+        return target
 
-    def update_persona(self, persona_id: str, request: PersonaUpdate) -> Persona:
+    def update_persona(self, persona_id: str, request: PersonaUpdate, owner: str = "", is_admin: bool = False) -> Persona:
         personas = self._load()
         selected: Persona | None = None
+        clean_owner = owner.strip().lower()
         for persona in personas:
             if persona.id == persona_id:
+                if clean_owner and persona.owner.strip() and persona.owner.strip().lower() != clean_owner and not is_admin:
+                    raise KeyError(persona_id)
                 persona.name = request.name.strip() or "Persona"
                 persona.description = request.description.strip()
                 selected = persona
@@ -69,21 +112,25 @@ class PersonasService:
         self._save(personas)
         return selected
 
-    def delete_persona(self, persona_id: str) -> Persona:
+    def delete_persona(self, persona_id: str, owner: str = "", is_admin: bool = False) -> Persona:
         personas = self._load()
         selected = next((persona for persona in personas if persona.id == persona_id), None)
         if selected is None:
             raise KeyError(persona_id)
+        clean_owner = owner.strip().lower()
+        if clean_owner and selected.owner.strip() and selected.owner.strip().lower() != clean_owner and not is_admin:
+            raise KeyError(persona_id)
         remaining = [persona for persona in personas if persona.id != persona_id]
-        if selected.active and remaining:
-            remaining[0].active = True
+        scope_owner = selected.owner.strip().lower()
+        scope_remaining = [p for p in remaining if p.owner.strip().lower() == scope_owner]
+        if selected.active and scope_remaining:
+            scope_remaining[0].active = True
         if selected.avatar:
             avatar_path = self.avatars_dir / Path(selected.avatar).name
             if avatar_path.exists():
                 avatar_path.unlink()
         self._save(remaining)
         return selected
-
     def set_avatar(self, persona_id: str, filename: str, content: bytes) -> Persona:
         suffix = Path(filename).suffix.lower()
         if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:

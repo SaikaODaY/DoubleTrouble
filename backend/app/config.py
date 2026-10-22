@@ -11,12 +11,40 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG_PATH = Path(
-    os.environ.get("DOUBLE_TROUBLE_CONFIG_PATH")
-    or os.environ.get("CONFIG_PATH")
-    or (PROJECT_ROOT / "config" / "config.yaml")
-)
 
+
+def _resolve_data_root() -> Path:
+    app_data = PROJECT_ROOT / "data"
+    if app_data.exists() and os.path.ismount(app_data):
+        return app_data
+    for name in ("DOUBLE_TROUBLE_DATA_ROOT", "DATA_ROOT"):
+        val = os.environ.get(name, "").strip()
+        if val:
+            return Path(val)
+    return app_data
+
+
+def _resolve_config_path() -> Path:
+    app_config_dir = PROJECT_ROOT / "config"
+    if app_config_dir.exists() and os.path.ismount(app_config_dir):
+        return app_config_dir / "config.yaml"
+    for name in ("DOUBLE_TROUBLE_CONFIG_PATH", "CONFIG_PATH"):
+        val = os.environ.get(name, "").strip()
+        if val:
+            p = Path(val)
+            data_root = _resolve_data_root()
+            if p.as_posix().startswith("/data/") and data_root != Path("/data"):
+                return data_root / p.name
+            return p
+    data_root = _resolve_data_root()
+    if (data_root / "config.yaml").exists():
+        return data_root / "config.yaml"
+    if (app_config_dir / "config.yaml").exists():
+        return app_config_dir / "config.yaml"
+    return data_root / "config.yaml"
+
+
+DEFAULT_CONFIG_PATH = _resolve_config_path()
 class ServerConfig(BaseModel):
     listen_ip: str = Field(default="127.0.0.1", validation_alias=AliasChoices("listen_ip", "host"))
     listen_port: int = Field(default=8017, validation_alias=AliasChoices("listen_port", "port"))
@@ -126,12 +154,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     if env_open_browser is not None:
         config.server.open_browser_on_start = env_open_browser
 
-    env_data_root = _env_str(("DOUBLE_TROUBLE_DATA_ROOT", "DATA_ROOT"))
-    if env_data_root:
-        config.storage.data_root = Path(env_data_root)
+    resolved_root = _resolve_data_root()
+    if os.environ.get("DOUBLE_TROUBLE_DATA_ROOT") or os.environ.get("DATA_ROOT") or os.path.ismount(resolved_root):
+        config.storage.data_root = resolved_root
     elif not config.storage.data_root.is_absolute():
         config.storage.data_root = PROJECT_ROOT / config.storage.data_root
-
     env_allow_ext = _env_bool(("DOUBLE_TROUBLE_ALLOW_EXTERNAL", "ALLOW_EXTERNAL_CONNECTIONS"))
     if env_allow_ext is not None:
         config.security.allow_external_connections = env_allow_ext

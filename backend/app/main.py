@@ -11,7 +11,8 @@ import time
 import httpx
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
+from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -170,12 +171,11 @@ class MagicTranslationRequest(BaseModel):
 def _session_id_from_request(request: Request | None = None) -> str:
     if request is None:
         return DEFAULT_SESSION_ID
-    header_sid = request.headers.get("x-doubletrouble-session", "").strip()
+    header_sid = unquote(request.headers.get("x-doubletrouble-session", "").strip())
     if header_sid:
         return header_sid
     query_sid = str(request.query_params.get("session_id") or "").strip()
     return query_sid or DEFAULT_SESSION_ID
-
 
 def _target_sessions_for_chat(card_id: str, chat_id: str, primary_session_id: str = DEFAULT_SESSION_ID, switch_active: bool = False) -> set[str]:
     targets = {primary_session_id or DEFAULT_SESSION_ID}
@@ -229,12 +229,11 @@ async def _broadcast_presence(session_id: str = DEFAULT_SESSION_ID) -> None:
 
 
 def _actor_from_request(request: Request) -> str:
-    actor = request.headers.get("x-doubletrouble-actor", "").strip()
+    actor = unquote(request.headers.get("x-doubletrouble-actor", "").strip())
     user = _auth_user_from_request(request)
     if user:
         return user.username
     return actor
-
 
 def _token_from_request(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
@@ -308,6 +307,8 @@ def _require_permission(request: Request, action: str) -> None:
     user = _auth_user_from_request(request)
     if settings_service.auth_required() and not user:
         raise HTTPException(status_code=401, detail="Authentication required")
+    if not settings_service.auth_required() and not user:
+        return
     permissions = settings_service.security_permissions().model_dump()
     rule = permissions.get(action, {"mode": "everyone", "users": []})
     mode = str(rule.get("mode") or "everyone")
@@ -316,12 +317,11 @@ def _require_permission(request: Request, action: str) -> None:
         return
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if mode == "admins" and user.is_admin:
+    if mode == "admins" and (user.is_admin or not any(u.is_admin for u in auth_service.state.users)):
         return
     if mode == "users" and (user.is_admin or user.username.lower() in allowed_users):
         return
     raise HTTPException(status_code=403, detail="Not enough permissions")
-
 
 def _notification_text(message: str, actor: str = "") -> str:
     return f"{actor}: {message}" if actor else message
@@ -398,7 +398,7 @@ def _active_openai_preset() -> dict[str, object] | None:
 
 
 def _generation_persona_context(request: BotReplyRequest | None, history: list[Any] | None = None) -> tuple[str | None, str | None, bool, list[str]]:
-    known_list = personas_service.list_personas()
+    known_list = personas_service.list_all_personas()
     known_personas = {persona.id: persona for persona in known_list}
     known_by_name = {persona.name.strip().lower(): persona for persona in known_list if persona.name.strip()}
     participants: list[GenerationParticipantRequest] = list((request.participants if request else None) or [])
@@ -1293,6 +1293,7 @@ async def auth_register(payload: AuthRequest, request: Request, response: Respon
         user, token = auth_service.register(payload.username, payload.password)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    personas_service.list_personas(owner=user.username, is_admin=user.is_admin)
     response.set_cookie(
         "doubletrouble_auth_token",
         token,
@@ -1302,7 +1303,6 @@ async def auth_register(payload: AuthRequest, request: Request, response: Respon
         path="/",
     )
     return {"token": token, "user": auth_service.public_user(user)}
-
 
 @app.post("/api/auth/login")
 async def auth_login(payload: AuthRequest, request: Request, response: Response) -> dict[str, object]:
@@ -2501,7 +2501,7 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
             if target_index < 0:
                 raise KeyError(replace_message_id)
             history = chat.messages[:target_index]
-        openai_preset = request.openai_preset if request and isinstance(request.openai_preset, dict) else _active_openai_preset()
+        openai_preset = request.openai_preset if (request and isinstance(request.openai_preset, dict) and request.openai_preset) else _active_openai_preset()
         character_data = character_cards_service.card_data(card_id)
         persona_name, persona_description, multi_user_mode, persona_ids = _generation_persona_context(request, history)
         regex_scripts = request.regex_scripts if request else []
@@ -2678,27 +2678,30 @@ async def character_card_image(card_id: str, request: Request) -> FileResponse:
 @app.get("/api/personas")
 async def list_personas(request: Request) -> dict[str, object]:
     _require_permission(request, "view_personas")
-    return {"personas": [persona.model_dump(mode="json") for persona in personas_service.list_personas()]}
+    user = _auth_user_from_request(request)
+    owner = user.username if user else ""
+    is_admin = bool(user and user.is_admin)
+    return {"personas": [persona.model_dump(mode="json") for persona in personas_service.list_personas(owner=owner, is_admin=is_admin)]}
 
 
 @app.post("/api/personas")
 async def create_persona(payload: PersonaCreate, request: Request) -> dict[str, object]:
     _require_permission(request, "edit_personas")
-    persona = personas_service.create_persona(payload)
+    user = _auth_user_from_request(request)
+    persona = personas_service.create_persona(payload, owner=user.username if user else "")
     await _broadcast_shared_settings("personas")
-    await _broadcast_notification(f"создал персону: {persona.name}", actor=_actor_from_request(request))
     return {"persona": persona.model_dump(mode="json")}
 
 
 @app.put("/api/personas/{persona_id}")
 async def update_persona(persona_id: str, payload: PersonaUpdate, request: Request) -> dict[str, object]:
     _require_permission(request, "edit_personas")
+    user = _auth_user_from_request(request)
     try:
-        persona = personas_service.update_persona(persona_id, payload)
+        persona = personas_service.update_persona(persona_id, payload, owner=user.username if user else "", is_admin=bool(user and user.is_admin))
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
     await _broadcast_shared_settings("personas")
-    await _broadcast_notification(f"обновил персону: {persona.name}", actor=_actor_from_request(request))
     return {"persona": persona.model_dump(mode="json")}
 
 
@@ -2706,29 +2709,27 @@ async def update_persona(persona_id: str, payload: PersonaUpdate, request: Reque
 async def delete_persona(persona_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "delete_personas")
     _require_delete_unlocked("personas", persona_id)
+    user = _auth_user_from_request(request)
     try:
-        persona = personas_service.delete_persona(persona_id)
+        persona = personas_service.delete_persona(persona_id, owner=user.username if user else "", is_admin=bool(user and user.is_admin))
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
     settings_service.clear_delete_lock("personas", persona_id)
     await _broadcast_delete_locks()
     await _broadcast_shared_settings("personas")
-    await _broadcast_notification(f"удалил персону: {persona.name}", actor=_actor_from_request(request))
     return {"ok": True, "persona": persona.model_dump(mode="json")}
 
 
 @app.put("/api/personas/{persona_id}/active")
 async def activate_persona(persona_id: str, request: Request) -> dict[str, object]:
     _require_permission(request, "edit_personas")
+    user = _auth_user_from_request(request)
     try:
-        persona = personas_service.activate_persona(persona_id)
+        persona = personas_service.activate_persona(persona_id, owner=user.username if user else "")
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Persona not found") from error
     await _broadcast_shared_settings("personas")
-    await _broadcast_notification(f"изменил активную персону: {persona.name}", actor=_actor_from_request(request))
     return {"persona": persona.model_dump(mode="json")}
-
-
 @app.post("/api/personas/{persona_id}/avatar")
 async def upload_persona_avatar(persona_id: str, request: Request, file: UploadFile = File(...)) -> dict[str, object]:
     _require_permission(request, "edit_personas")

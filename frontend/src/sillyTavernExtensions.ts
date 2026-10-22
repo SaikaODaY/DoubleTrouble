@@ -734,7 +734,10 @@ function installFileInputLabelCompatibility() {
       return;
     }
     const label = target.closest('label');
-    const input = label?.querySelector('input[type="file"]');
+    if (!label || !label.closest('#extensions_settings') || label.closest('[data-dt-extension-owner="regex"], [data-dt-extension-owner="magic-translation"]')) {
+      return;
+    }
+    const input = label.querySelector('input[type="file"]');
     if (!(input instanceof HTMLInputElement)) {
       return;
     }
