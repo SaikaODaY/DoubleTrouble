@@ -1506,9 +1506,9 @@ export default function App() {
           }
         }
         if (payload.type === 'round.all_ready') {
-          const shouldTrigger = payload.trigger_participant_id
-            ? payload.trigger_participant_id === participantIdRef.current
-            : extensionLeader;
+          const shouldTrigger = (!botReplyAllowed || (securityPermissions.generate && securityPermissions.generate.mode !== 'everyone'))
+            ? extensionLeader
+            : (payload.trigger_participant_id ? payload.trigger_participant_id === participantIdRef.current : extensionLeader);
           if (shouldTrigger && !activeGenerationRef.current && activeChatRef.current) {
             addToast('⚡ Все игроки готовы — запускаем ответ бота!');
             window.setTimeout(() => { void requestBotReplyRef.current(); }, 120);
