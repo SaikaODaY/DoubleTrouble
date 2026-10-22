@@ -637,8 +637,9 @@ function loadBuiltInExtensionSettings(): BuiltInExtensionSettings {
     return cachedBuiltInExtensionSettings;
   }
   try {
-    cachedBuiltInExtensionSettings = { ...defaultBuiltInExtensionSettings, ...JSON.parse(window.localStorage.getItem(BUILT_IN_EXTENSIONS_STORAGE_KEY) || '{}') };
-    return cachedBuiltInExtensionSettings;
+    const next: BuiltInExtensionSettings = { ...defaultBuiltInExtensionSettings, ...JSON.parse(window.localStorage.getItem(BUILT_IN_EXTENSIONS_STORAGE_KEY) || '{}') };
+    cachedBuiltInExtensionSettings = next;
+    return next;
   } catch {
     cachedBuiltInExtensionSettings = defaultBuiltInExtensionSettings;
     return defaultBuiltInExtensionSettings;
@@ -3916,7 +3917,7 @@ export default function App() {
         </div>
 
         <nav className="topbar-quick-nav" aria-label={t('topbar.menu')}>
-          {getMenuSections(t).map((item) => {
+          {getMenuItems(t).map((item) => {
             const isActive = menuOpen && activeSection === item.id;
             return (
               <button
