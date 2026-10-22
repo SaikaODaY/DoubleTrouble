@@ -2538,7 +2538,8 @@ async def summarize_bot_chat_memory(card_id: str, chat_id: str, request: Request
 async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Request, request: BotReplyRequest | None = None) -> dict[str, object]:
     _require_permission(http_request, "generate")
     sid = _session_id_from_request(http_request)
-    if not settings_service.bot_reply_allowed() and not (request and request.replace_message_id):
+    req_user = _auth_user_from_request(http_request)
+    if not settings_service.bot_reply_allowed() and not (req_user and req_user.is_admin) and not (request and request.replace_message_id):
         raise HTTPException(status_code=403, detail="Bot reply button is disabled")
     task_key = f"{card_id}:{chat_id}"
     if task_key in generation_tasks:

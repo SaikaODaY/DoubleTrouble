@@ -922,6 +922,18 @@ export default function App() {
     }
     return false;
   }, [securityPermissions.view_reasoning, authUser]);
+  const canTriggerBotReply = useMemo(() => {
+    if (authUser?.is_admin) return true;
+    if (!botReplyAllowed) return false;
+    const rule = securityPermissions.generate || { mode: 'everyone', users: [] };
+    if (rule.mode === 'everyone') return true;
+    if (!authUser) return false;
+    if (rule.mode === 'users') {
+      const allowed = new Set((rule.users || []).map((u) => u.trim().toLowerCase()).filter(Boolean));
+      return allowed.has(authUser.username.trim().toLowerCase());
+    }
+    return false;
+  }, [botReplyAllowed, securityPermissions.generate, authUser]);
   const selectedPersona = useMemo(() => personas.find((persona) => persona.id === selectedPersonaId) ?? personas[0] ?? null, [personas, selectedPersonaId]);
   const connectedPlayers = useMemo(() => {
     const byKey = new Map<string, Participant>();
@@ -4442,7 +4454,7 @@ export default function App() {
                   <Icon name="x" />
                 </button>
               ) : (
-                <button className="ghost-button bot-reply-button icon-only-btn" type="button" disabled={!activeChat || accessDenied.chats || (!botReplyAllowed && !authUser?.is_admin)} title={(!botReplyAllowed && !authUser?.is_admin) ? t('composer.botReply.disabled') : t('composer.botReply')} aria-label={t('composer.botReply')} onClick={() => void requestBotReply()}>
+                <button className="ghost-button bot-reply-button icon-only-btn" type="button" disabled={!activeChat || accessDenied.chats || !canTriggerBotReply} title={!canTriggerBotReply ? t('composer.botReply.disabled') : t('composer.botReply')} aria-label={t('composer.botReply')} onClick={() => void requestBotReply()}>
                   <Icon name="bot" />
                 </button>
               )}
