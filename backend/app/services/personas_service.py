@@ -31,6 +31,7 @@ class PersonasService:
     def __init__(self, path: Path, avatars_dir: Path) -> None:
         self.path = path
         self.avatars_dir = avatars_dir
+        self._cache: tuple[int, int, list[Persona]] | None = None
 
     def list_all_personas(self) -> list[Persona]:
         return self._load()
@@ -168,7 +169,11 @@ class PersonasService:
 
     def _load(self) -> list[Persona]:
         if not self.path.exists():
+            self._cache = None
             return []
+        st = self.path.stat()
+        if self._cache and self._cache[0] == st.st_mtime_ns and self._cache[1] == st.st_size:
+            return [p.model_copy(deep=True) for p in self._cache[2]]
         with self.path.open("r", encoding="utf-8") as personas_file:
             raw = yaml.safe_load(personas_file) or []
         personas = [Persona.model_validate(item) for item in raw if isinstance(item, dict)]
@@ -178,6 +183,7 @@ class PersonasService:
                 mtime = int(avatar_file.stat().st_mtime) if avatar_file.exists() else 0
                 base_url = f"/api/personas/avatars/{Path(persona.avatar).name}"
                 persona.avatar_url = f"{base_url}?v={mtime}" if mtime else base_url
+        self._cache = (st.st_mtime_ns, st.st_size, [p.model_copy(deep=True) for p in personas])
         return personas
 
     def _save(self, personas: list[Persona]) -> None:
@@ -186,3 +192,4 @@ class PersonasService:
         with tmp_path.open("w", encoding="utf-8") as personas_file:
             yaml.safe_dump([persona.model_dump(mode="json") for persona in personas], personas_file, sort_keys=False, allow_unicode=True)
         os.replace(tmp_path, self.path)
+        self._cache = None

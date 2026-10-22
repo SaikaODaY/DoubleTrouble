@@ -55,18 +55,21 @@ class AnthropicProvider:
                 if response.status_code >= 400:
                     await response.aread()
                 response.raise_for_status()
-                buffer = ""
-                async for chunk in response.aiter_text():
-                    buffer += chunk
-                    while True:
-                        sep_index = self._find_event_sep(buffer)
-                        if sep_index < 0:
-                            break
-                        raw_event, buffer = buffer[:sep_index], buffer[sep_index + 2 :]
-                        for token in self._tokens_from_event(raw_event):
-                            yield token
-                if buffer.strip():
-                    for token in self._tokens_from_event(buffer):
+                data_lines: list[str] = []
+                async for raw_line in response.aiter_lines():
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        if data_lines:
+                            for token in self._tokens_from_data("\n".join(data_lines)):
+                                yield token
+                            data_lines.clear()
+                        continue
+                    if stripped.startswith(":") or stripped.startswith("event:"):
+                        continue
+                    if stripped.startswith("data:"):
+                        data_lines.append(stripped[5:].strip())
+                if data_lines:
+                    for token in self._tokens_from_data("\n".join(data_lines)):
                         yield token
 
     def _request_body(self, request: GenerationRequest, stream: bool) -> dict[str, Any]:
@@ -78,12 +81,17 @@ class AnthropicProvider:
                     system_parts.append(message.content)
                 continue
             role = "user" if message.role == "user" else "assistant"
-            messages.append({"role": role, "content": message.content})
+            content = message.content or ""
+            if not content.strip():
+                continue
+            if messages and messages[-1]["role"] == role:
+                messages[-1]["content"] = f"{messages[-1]['content']}\n\n{content}"
+            else:
+                messages.append({"role": role, "content": content})
 
         # Anthropic requires non-empty user messages list
         if not messages or messages[0]["role"] != "user":
             messages.insert(0, {"role": "user", "content": "."})
-
         body: dict[str, Any] = {
             "model": request.model,
             "messages": messages,
@@ -118,25 +126,8 @@ class AnthropicProvider:
             pool=self.timeout_seconds,
         )
 
-    def _find_event_sep(self, buffer: str) -> int:
-        index = buffer.find("\n\n")
-        carriage = buffer.find("\r\n\r\n")
-        if carriage >= 0 and (index < 0 or carriage < index):
-            return carriage
-        return index
-
-    def _tokens_from_event(self, event: str) -> list[str]:
-        data_lines: list[str] = []
-        for raw_line in event.splitlines():
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith(":") or stripped.startswith("event:"):
-                continue
-            if stripped.startswith("data:"):
-                data_lines.append(stripped[5:].strip())
-        if not data_lines:
-            return []
-        payload = "\n".join(data_lines)
-        if payload == "[DONE]":
+    def _tokens_from_data(self, payload: str) -> list[str]:
+        if not payload or payload == "[DONE]":
             return []
         try:
             data = json.loads(payload)
@@ -144,14 +135,13 @@ class AnthropicProvider:
             return []
         if data.get("type") == "content_block_delta":
             delta = data.get("delta") or {}
-            text = delta.get("text") or delta.get("partial_json") or ""
+            text = delta.get("text") or delta.get("thinking") or delta.get("partial_json") or ""
             return [text] if isinstance(text, str) and text else []
         if data.get("type") == "message_delta":
             delta = data.get("delta") or {}
             text = delta.get("text") or ""
             return [text] if isinstance(text, str) and text else []
         return []
-
     def _extract_text(self, data: dict[str, Any]) -> str:
         parts = data.get("content") or []
         if isinstance(parts, list):

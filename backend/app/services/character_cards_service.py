@@ -73,13 +73,19 @@ class CharacterCardsService:
                 continue
         return cards
 
+    def get_card(self, card_id: str) -> CharacterCardSummary:
+        path = self._path_from_card_id(card_id)
+        if path is None:
+            raise FileNotFoundError(card_id)
+        return self._summary_from_file(path)
+
     def import_card(self, filename: str, content: bytes) -> CharacterCardSummary:
         metadata = self._read_json_metadata(content) if filename.lower().endswith(".json") else self.read_card_metadata(content)
         data = self._card_data(metadata)
         name = str(data.get("name") or metadata.get("name") or Path(filename).stem or "Character")
         target = self._unique_path(self._safe_filename(name), ".png")
         target.write_bytes(self._write_card_metadata(FALLBACK_PNG, metadata) if filename.lower().endswith(".json") else content)
-        return self._summary_from_metadata(target, metadata)
+        return self._store_cache(target, metadata)
 
     def create_card(self, request: CharacterCardCreate, avatar_content: bytes | None = None) -> CharacterCardSummary:
         name = request.name.strip() or "Character"
@@ -90,8 +96,7 @@ class CharacterCardsService:
 
         target = self._unique_path(self._safe_filename(name), ".png")
         target.write_bytes(self._write_card_metadata(source_png, metadata))
-        return self._summary_from_metadata(target, metadata)
-
+        return self._store_cache(target, metadata)
     def update_card(self, card_id: str, request: CharacterCardUpdate) -> CharacterCardSummary:
         path = self._path_from_card_id(card_id)
         if path is None:
@@ -117,7 +122,7 @@ class CharacterCardsService:
         else:
             metadata.update(data)
         path.write_bytes(self._write_card_metadata(content, metadata))
-        return self._summary_from_metadata(path, metadata)
+        return self._store_cache(path, metadata)
 
     def update_card_avatar(self, card_id: str, avatar_content: bytes) -> CharacterCardSummary:
         path = self._path_from_card_id(card_id)
@@ -127,8 +132,7 @@ class CharacterCardsService:
             raise ValueError("Avatar must be a PNG file")
         metadata = self.read_card_metadata(path.read_bytes())
         path.write_bytes(self._write_card_metadata(avatar_content, metadata))
-        return self._summary_from_metadata(path, metadata)
-
+        return self._store_cache(path, metadata)
     def delete_card(self, card_id: str) -> CharacterCardSummary:
         path = self._path_from_card_id(card_id)
         if path is None:
@@ -168,23 +172,30 @@ class CharacterCardsService:
             raise ValueError("JSON card has no character name")
         return metadata
 
+    def _store_cache(self, path: Path, metadata: dict[str, Any]) -> CharacterCardSummary:
+        st = path.stat()
+        summary = self._summary_from_metadata(path, metadata, st.st_mtime)
+        self._cache[path] = (st.st_mtime_ns, st.st_size, metadata, summary)
+        self._id_to_path[summary.id] = path
+        return summary
+
     def _cached_from_file(self, path: Path) -> tuple[dict[str, Any], CharacterCardSummary]:
         st = path.stat()
         cached = self._cache.get(path)
         if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
             return cached[2], cached[3]
         metadata = self._read_card_metadata_from_path(path)
-        summary = self._summary_from_metadata(path, metadata)
+        summary = self._summary_from_metadata(path, metadata, st.st_mtime)
         self._cache[path] = (st.st_mtime_ns, st.st_size, metadata, summary)
         self._id_to_path[summary.id] = path
         return metadata, summary
-
     def _summary_from_file(self, path: Path) -> CharacterCardSummary:
         _, summary = self._cached_from_file(path)
         return summary
-    def _summary_from_metadata(self, path: Path, metadata: dict[str, Any]) -> CharacterCardSummary:
+    def _summary_from_metadata(self, path: Path, metadata: dict[str, Any], mtime: float | None = None) -> CharacterCardSummary:
         data = self._card_data(metadata)
         tags = data.get("tags") or metadata.get("tags") or []
+        resolved_mtime = int(mtime if mtime is not None else path.stat().st_mtime)
         return CharacterCardSummary(
             id=self._card_id(path),
             filename=path.name,
@@ -199,7 +210,7 @@ class CharacterCardsService:
             tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
             spec=str(metadata.get("spec") or ""),
             spec_version=str(metadata.get("spec_version") or ""),
-            image_url=f"/api/cards/{self._card_id(path)}/image?v={int(path.stat().st_mtime)}",
+            image_url=f"/api/cards/{self._card_id(path)}/image?v={resolved_mtime}",
         )
 
     def _card_data(self, metadata: dict[str, Any]) -> dict[str, Any]:

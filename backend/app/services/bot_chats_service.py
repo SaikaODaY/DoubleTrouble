@@ -139,6 +139,7 @@ class BotChatsService:
     def __init__(self, chats_dir: Path) -> None:
         self.chats_dir = chats_dir
         self._summary_cache: dict[Path, tuple[int, int, BotChatSummary]] = {}
+        self._chat_cache: dict[Path, tuple[int, int, BotChat]] = {}
 
     def list_chats(self, card_id: str) -> list[BotChatSummary]:
         directory = self._card_chat_dir(card_id)
@@ -151,12 +152,18 @@ class BotChatsService:
             except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError):
                 continue
         return summaries
+
     def get_chat(self, card_id: str, chat_id: str) -> BotChat:
         path = self._chat_path(card_id, chat_id)
         if not path.exists():
             raise FileNotFoundError(chat_id)
-        return BotChat.model_validate(json.loads(path.read_text(encoding="utf-8")))
-
+        st = path.stat()
+        cached = self._chat_cache.get(path)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2].model_copy(deep=True)
+        chat = BotChat.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        self._chat_cache[path] = (st.st_mtime_ns, st.st_size, chat.model_copy(deep=True))
+        return chat
     def current_or_create(self, card_id: str, character_name: str) -> BotChat:
         chats = self.list_chats(card_id)
         if chats:
@@ -194,6 +201,7 @@ class BotChatsService:
         if not path.exists():
             raise FileNotFoundError(chat_id)
         self._summary_cache.pop(path, None)
+        self._chat_cache.pop(path, None)
         path.unlink()
 
     def delete_card_chats(self, card_id: str) -> None:
@@ -202,6 +210,7 @@ class BotChatsService:
             return
         for path in directory.glob("*.json"):
             self._summary_cache.pop(path, None)
+            self._chat_cache.pop(path, None)
             path.unlink()
         try:
             directory.rmdir()
@@ -379,10 +388,12 @@ class BotChatsService:
         if len(messages) == len(chat.messages):
             raise KeyError(message_id)
         chat.messages = messages
+        visible_len = len([m for m in messages if not m.hidden and not m.is_ooc])
+        if chat.memory_summarized_count > visible_len:
+            chat.memory_summarized_count = visible_len
         chat.updated_at = utc_now()
         self._save(chat)
         return chat
-
     def add_bot_message(self, card_id: str, chat_id: str, author: str, content: str, avatar_url: str = "", swipes: list[str] | None = None) -> BotChat:
         chat = self.get_chat(card_id, chat_id)
         cleaned_swipes = [swipe.strip() for swipe in (swipes or []) if swipe.strip()]
@@ -612,6 +623,7 @@ class BotChatsService:
         tmp_path.write_text(json.dumps(chat.model_dump(mode="json"), ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp_path, path)
         st = path.stat()
+        self._chat_cache[path] = (st.st_mtime_ns, st.st_size, chat.model_copy(deep=True))
         self._summary_cache[path] = (
             st.st_mtime_ns,
             st.st_size,
@@ -630,7 +642,12 @@ class BotChatsService:
         cached = self._summary_cache.get(path)
         if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
             return cached[2]
-        chat = BotChat.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        cached_chat = self._chat_cache.get(path)
+        if cached_chat and cached_chat[0] == st.st_mtime_ns and cached_chat[1] == st.st_size:
+            chat = cached_chat[2]
+        else:
+            chat = BotChat.model_validate(json.loads(path.read_text(encoding="utf-8")))
+            self._chat_cache[path] = (st.st_mtime_ns, st.st_size, chat.model_copy(deep=True))
         summary = BotChatSummary(
             id=chat.id,
             title=chat.title,

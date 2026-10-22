@@ -874,6 +874,7 @@ export default function App() {
   const [typingPlayers, setTypingPlayers] = useState<Record<string, string>>({});
   const lastTypingSentAtRef = useRef(0);
   const typingTimersRef = useRef<Record<string, number>>({});
+  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string } | null>(null);
   const [imagePendingMessages, setImagePendingMessages] = useState<Record<string, boolean>>({});
@@ -1056,6 +1057,7 @@ export default function App() {
     let rafId = 0;
     let lastTime = performance.now();
     const tick = (now: number) => {
+      let keepRunning = false;
       setDisplayedStreamText((prev) => {
         if (prev === generationStreamText) return prev;
         if (!generationStreamText.startsWith(prev)) {
@@ -1066,12 +1068,18 @@ export default function App() {
         const dt = Math.max(8, now - lastTime);
         lastTime = now;
         const step = Math.max(1, Math.ceil(remaining * Math.min(0.32, dt / 85)));
-        return generationStreamText.slice(0, prev.length + step);
+        const next = generationStreamText.slice(0, prev.length + step);
+        if (next.length < generationStreamText.length) {
+          keepRunning = true;
+        }
+        return next;
       });
       if (isNearBottomRef.current && chatScrollRef.current) {
         chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
       }
-      rafId = window.requestAnimationFrame(tick);
+      if (keepRunning) {
+        rafId = window.requestAnimationFrame(tick);
+      }
     };
     rafId = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(rafId);
@@ -1346,8 +1354,23 @@ export default function App() {
               rememberChatSelection(targetCard.id, payload.chat.id);
             }
           }
-          if (sameCard && payload.card_id) {
-            void refreshCardChats(payload.card_id);
+          if (sameCard && payload.chat) {
+            const updatedChat = payload.chat;
+            setBotChats((current) => {
+              const summary: BotChatSummary = {
+                id: updatedChat.id,
+                title: updatedChat.title,
+                filename: `${updatedChat.id}.json`,
+                message_count: updatedChat.messages?.length ?? 0,
+                created_at: updatedChat.created_at,
+                updated_at: updatedChat.updated_at,
+              };
+              const idx = current.findIndex((item) => item.id === updatedChat.id);
+              if (idx < 0) return [summary, ...current];
+              const next = [...current];
+              next[idx] = summary;
+              return next;
+            });
           }
         }
         if (payload.type === 'card.select' && payload.card_id && payload.source_participant_id !== participantIdRef.current) {
@@ -2122,7 +2145,7 @@ export default function App() {
       if (participantPersona && !participantPersonaRestoredRef.current) {
         participantPersonaRestoredRef.current = true;
         applySelectedPersonaId(participantPersona.id);
-      } else if (sessionSnapshotReceivedRef.current && !data.personas.some((persona) => persona.id === currentId)) {
+      } else if (!data.personas.some((persona) => persona.id === currentId)) {
         const nextPersona = data.personas.find((persona) => persona.active) || data.personas[0];
         if (nextPersona) {
           applySelectedPersonaId(nextPersona.id);
@@ -3299,6 +3322,9 @@ export default function App() {
     }
     if (overrideContent === undefined) {
       setChatInput('');
+      if (composerTextareaRef.current) {
+        composerTextareaRef.current.style.height = '';
+      }
     }
     const response = await fetch(`/api/cards/${encodeURIComponent(activeCard.id)}/chats/${encodeURIComponent(activeChat.id)}/messages`, {
       method: 'POST',
@@ -3538,7 +3564,8 @@ export default function App() {
       return;
     }
     const rawContent = editingMessageText.trim();
-    const content = getRegexedString(rawContent, regex_placement.MD_DISPLAY, { isMarkdown: true, isEdit: true });
+    const editPlacement = message.role === 'user' ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
+    const content = getRegexedString(rawContent, editPlacement, { isEdit: true });
     if (!content || content === message.content) {
       setEditingMessageId('');
       setEditingMessageText('');
@@ -4194,7 +4221,7 @@ export default function App() {
                     </div>
                   ) : (
                     <>
-                      <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}:${regexRenderTick}`} content={visibleMessageContent} reasoning={reasoningDisplay} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />
+                      <MessageContent key={`${message.id}:${extensionMessageRenderVersions[message.id] || 0}:${regexRenderTick}`} content={visibleMessageContent} role={message.role} reasoning={reasoningDisplay} imagePending={isImagePending} renderPendingMarkersAsSpinner={!extensionLeader} isStreaming={generationReplaceMessageId === message.id && Boolean(generationStreamText)} />
                       {rollPrompts.length > 0 ? (
                         <div className="bot-roll-prompts">
                           {rollPrompts.map((rawSpec, rIdx) => {
@@ -4232,7 +4259,7 @@ export default function App() {
                   <header>
                     <span className="message-name-block"><strong className="identity-name"><span>{activeCard?.name || t('composer.bot')}</span></strong></span>
                   </header>
-                  {(displayedStreamText || generationStreamText) ? <MessageContent content={`${displayedStreamText || generationStreamText}▍`} reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
+                  {(displayedStreamText || generationStreamText) ? <MessageContent content={`${displayedStreamText || generationStreamText}▍`} role="assistant" reasoning={reasoningDisplay} isStreaming /> : <div className="message-content"><p><span className="thinking-dots"><i /> <i /> <i /></span>{generationStatus || `${activeCard?.name || t('composer.bot')} ${t('composer.typing')}`}</p></div>}
                 </div>
               </article>
             ) : null}
@@ -4346,6 +4373,7 @@ export default function App() {
               </div>
             ) : null}
             <textarea
+              ref={composerTextareaRef}
               value={chatInput}
               rows={1}
               placeholder={
@@ -7581,9 +7609,10 @@ function ReasoningPresetPanel({ settings, assistantPrefill, update, updateAssist
   );
 }
 
-const MessageContent = memo(function MessageContent({ content, reasoning, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; reasoning: ReasoningDisplaySettings; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
+const MessageContent = memo(function MessageContent({ content, role = 'assistant', reasoning, imagePending = false, renderPendingMarkersAsSpinner = false, isStreaming = false }: { content: string; role?: string; reasoning: ReasoningDisplaySettings; imagePending?: boolean; renderPendingMarkersAsSpinner?: boolean; isStreaming?: boolean }) {
   const { t } = useLocaleContext();
-  const regexedContent = getRegexedString(content, regex_placement.MD_DISPLAY, { isMarkdown: true });
+  const displayPlacement = role === 'user' ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
+  const regexedContent = getRegexedString(content, displayPlacement, { isMarkdown: true });
   const parsed = reasoning.autoParse ? splitReasoning(regexedContent, reasoning) : { reasoning: '', visible: regexedContent, complete: false };
   const reasoningText = parsed.reasoning ? getRegexedString(parsed.reasoning, regex_placement.REASONING, { isMarkdown: true }) : '';
   const formatOptions: ExtensionMessageFormatOptions = { forceImagePending: imagePending, renderPendingMarkersAsSpinner, reasoning, t };

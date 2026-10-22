@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import secrets
-from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -89,9 +89,13 @@ class AuthService:
 
     def _create_session(self, username: str) -> str:
         token = secrets.token_urlsafe(32)
+        user_lower = username.lower()
+        user_sessions = [s for s in self.state.sessions if s.username.lower() == user_lower]
+        if len(user_sessions) >= 15:
+            oldest_tokens = {s.token for s in user_sessions[:-14]}
+            self.state.sessions = [s for s in self.state.sessions if s.token not in oldest_tokens]
         self.state.sessions.append(AuthSession(token=token, username=username))
         return token
-
     def _find_user(self, username: str) -> AuthUser | None:
         normalized = self._normalize_username(username)
         return next((user for user in self.state.users if user.username.lower() == normalized.lower()), None)
@@ -114,5 +118,7 @@ class AuthService:
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as auth_file:
+        tmp_path = self.path.with_suffix(".yaml.tmp")
+        with tmp_path.open("w", encoding="utf-8") as auth_file:
             yaml.safe_dump(self.state.model_dump(mode="json"), auth_file, sort_keys=False, allow_unicode=True)
+        os.replace(tmp_path, self.path)

@@ -19,8 +19,9 @@ class RegexService:
     @staticmethod
     @lru_cache(maxsize=1024)
     def regex_from_string(pattern: str) -> re.Pattern[str]:
-        match = re.match(r"^/(.*)/([gimuy]*)$", pattern)
+        match = re.match(r"^/(.*)/([gimsuyx]*)$", pattern, flags=re.DOTALL)
         if match:
+            body = match.group(1)
             flags_str = match.group(2) or ""
             flags = 0
             flag_map = {
@@ -33,10 +34,9 @@ class RegexService:
             for ch in flags_str:
                 if ch in flag_map:
                     flags |= flag_map[ch]
-                # g and y are JS-only and ignored in Python re
-            return re.compile(match.group(1), flags)
-        return re.compile(pattern)
-
+            body = body.replace("[^]", r"[\s\S]").replace(r"\/", "/")
+            return re.compile(body, flags)
+        return re.compile(pattern.replace("[^]", r"[\s\S]").replace(r"\/", "/"))
     @staticmethod
     def _substitute_params(text: str, user_name: str = "Player", char_name: str = "Bot") -> str:
         return (

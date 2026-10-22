@@ -78,22 +78,26 @@ class GoogleAIStudioProvider:
                 if response.status_code >= 400:
                     await response.aread()
                 response.raise_for_status()
-                buffer = ""
-                async for chunk in response.aiter_text():
-                    buffer += chunk
-                    while True:
-                        sep = self._sep(buffer)
-                        if sep < 0:
-                            break
-                        raw_event, buffer = buffer[:sep], buffer[sep + 2 :]
-                        token = self._event_to_token(raw_event)
-                        if token:
-                            yield token
-                if buffer.strip():
-                    token = self._event_to_token(buffer)
+                data_lines: list[str] = []
+                async for raw_line in response.aiter_lines():
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        if data_lines:
+                            token = self._payload_to_token("\n".join(data_lines))
+                            if token:
+                                yield token
+                            data_lines.clear()
+                        continue
+                    if stripped.startswith(":"):
+                        continue
+                    if stripped.startswith("data:"):
+                        data_lines.append(stripped[5:].strip())
+                    else:
+                        data_lines.append(stripped)
+                if data_lines:
+                    token = self._payload_to_token("\n".join(data_lines))
                     if token:
                         yield token
-
     def _chat_url(self, model: str, stream: bool) -> str:
         action = "streamGenerateContent" if stream else "generateContent"
         return f"{self.base_url}/{self.api_version}/models/{model}:{action}"
@@ -131,8 +135,20 @@ class GoogleAIStudioProvider:
                 if text.strip():
                     system_parts.append(text)
                 continue
+            if not text.strip():
+                continue
             role = "user" if message.role == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": text}]})
+            if contents and contents[-1]["role"] == role:
+                contents[-1]["parts"][0]["text"] = f"{contents[-1]['parts'][0]['text']}\n\n{text}"
+            else:
+                contents.append({"role": role, "parts": [{"text": text}]})
+
+        if system_parts and not use_sysprompt:
+            sys_joined = "\n\n".join(system_parts)
+            if contents and contents[0]["role"] == "user":
+                contents[0]["parts"][0]["text"] = f"{sys_joined}\n\n{contents[0]['parts'][0]['text']}"
+            else:
+                contents.insert(0, {"role": "user", "parts": [{"text": sys_joined}]})
 
         if not contents:
             contents.append({"role": "user", "parts": [{"text": "."}]})
@@ -162,34 +178,14 @@ class GoogleAIStudioProvider:
                 generation_config[key] = parameters.pop(key)
         return body
 
-    def _sep(self, buffer: str) -> int:
-        index = buffer.find("\n\n")
-        carriage = buffer.find("\r\n\r\n")
-        if carriage >= 0 and (index < 0 or carriage < index):
-            return carriage
-        return index
-
-    def _event_to_token(self, event: str) -> str:
-        data_lines: list[str] = []
-        for raw_line in event.splitlines():
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith(":"):
-                continue
-            if stripped.startswith("data:"):
-                data_lines.append(stripped[5:].strip())
-            else:
-                data_lines.append(stripped)
-        if not data_lines:
-            return ""
-        payload = "\n".join(data_lines)
-        if payload == "[DONE]":
+    def _payload_to_token(self, payload: str) -> str:
+        if not payload or payload == "[DONE]":
             return ""
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
             return ""
         return self._extract_text(data)
-
     def _extract_text(self, data: dict[str, Any]) -> str:
         candidates = data.get("candidates") or []
         chunks: list[str] = []

@@ -492,28 +492,31 @@ export function getRegexedString(rawString: string, placement: number, params: R
 
   const allRegex = getRegexScripts({ allowedOnly: true });
   allRegex.forEach((script) => {
-    if (
-      (script.markdownOnly && params.isMarkdown) ||
-      (script.promptOnly && params.isPrompt) ||
-      (!script.markdownOnly && !script.promptOnly && !params.isMarkdown && !params.isPrompt)
-    ) {
+    const hasDisplayPlacement = script.placement.includes(regex_placement.MD_DISPLAY);
+    const matchesMode =
+      (params.isMarkdown && (script.markdownOnly || (hasDisplayPlacement && !script.promptOnly))) ||
+      (params.isPrompt && script.promptOnly) ||
+      (!params.isMarkdown && !params.isPrompt && !script.markdownOnly && !script.promptOnly);
+
+    if (matchesMode) {
       if (params.isEdit && !script.runOnEdit) {
-        console.debug(`getRegexedString: Skipping script ${script.scriptName} because it does not run on edit`);
         return;
       }
 
       if (typeof params.depth === 'number') {
         if (!isNaN(script.minDepth ?? NaN) && script.minDepth !== null && script.minDepth >= -1 && params.depth < script.minDepth) {
-          console.debug(`getRegexedString: Skipping script ${script.scriptName} because depth ${params.depth} is less than minDepth ${script.minDepth}`);
           return;
         }
         if (!isNaN(script.maxDepth ?? NaN) && script.maxDepth !== null && script.maxDepth >= 0 && params.depth > script.maxDepth) {
-          console.debug(`getRegexedString: Skipping script ${script.scriptName} because depth ${params.depth} is greater than maxDepth ${script.maxDepth}`);
           return;
         }
       }
 
-      if (script.placement.includes(placement)) {
+      const matchesPlacement =
+        script.placement.includes(placement) ||
+        (Boolean(params.isMarkdown) && hasDisplayPlacement);
+
+      if (matchesPlacement) {
         finalString = runRegexScript(script, finalString, { characterOverride: params.characterOverride });
       }
     }

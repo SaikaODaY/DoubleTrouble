@@ -186,12 +186,19 @@ def _target_sessions_for_chat(card_id: str, chat_id: str, primary_session_id: st
     return targets
 
 
-async def _broadcast_chat(card_id: str, chat_id: str, switch_active: bool = False, session_id: str = DEFAULT_SESSION_ID) -> None:
+async def _broadcast_chat(card_id: str, chat_id: str, switch_active: bool = False, session_id: str = DEFAULT_SESSION_ID, chat: Any = None) -> None:
     session_service.set_active_chat(session_id, card_id, chat_id)
-    chat = bot_chats_service.get_chat(card_id, chat_id)
-    payload = {"type": "chat.updated", "card_id": card_id, "chat": chat.model_dump(mode="json"), "switch_active": switch_active}
+    resolved_chat = chat if chat is not None else bot_chats_service.get_chat(card_id, chat_id)
+    payload = {"type": "chat.updated", "card_id": card_id, "chat": resolved_chat.model_dump(mode="json"), "switch_active": switch_active}
     for target_sid in _target_sessions_for_chat(card_id, chat_id, session_id, switch_active):
         await connection_manager.broadcast(target_sid, payload)
+
+def _card_avatar_url(card_id: str) -> str:
+    try:
+        return character_cards_service.get_card(card_id).image_url
+    except FileNotFoundError:
+        return ""
+
 def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     chat = bot_chats_service.get_chat(card_id, chat_id)
     character_data = character_cards_service.card_data(card_id)
@@ -208,9 +215,7 @@ def _ensure_card_first_message(card_id: str, chat_id: str) -> object:
     greeting_swipes = [first_message, *alternate_greetings]
     if chat.messages:
         return bot_chats_service.sync_first_assistant_swipes(card_id, chat_id, greeting_swipes)
-    avatar_url = next((card.image_url for card in character_cards_service.list_cards() if card.id == card_id), "")
-    return bot_chats_service.add_bot_message(card_id, chat_id, chat.character_name, first_message, avatar_url, greeting_swipes)
-
+    return bot_chats_service.add_bot_message(card_id, chat_id, chat.character_name, first_message, _card_avatar_url(card_id), greeting_swipes)
 
 async def _broadcast_generation_state(card_id: str, chat_id: str, event_type: str, message: str = "", replace_message_id: str | None = None, streaming: bool | None = None, session_id: str = DEFAULT_SESSION_ID) -> None:
     event: dict[str, object] = {"type": event_type, "card_id": card_id, "chat_id": chat_id, "replace_message_id": replace_message_id}
@@ -2508,16 +2513,18 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         user_name = persona_name or "Player"
         char_name = chat.character_name or "Bot"
         if regex_scripts:
+            total_hist = len(history)
             history = [
                 message.model_copy(update={"content": RegexService.get_regexed_string(
                     message.content,
                     RegexService.PLACEMENT_USER_INPUT if message.role == "user" else RegexService.PLACEMENT_AI_OUTPUT,
                     regex_scripts,
                     is_prompt=True,
+                    depth=total_hist - 1 - idx,
                     user_name=user_name,
                     char_name=char_name,
                 )})
-                for message in history
+                for idx, message in enumerate(history)
             ]
         char_book = character_data.get("character_book") if isinstance(character_data.get("character_book"), dict) else None
         lorebook_context = lorebooks_service.active_context([message.content for message in history if not message.hidden and not getattr(message, "is_ooc", False)], card_id, chat_id, persona_ids, character_book=char_book)
@@ -2565,7 +2572,14 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         session_service.reset_round_ready(sid)
         await _broadcast_presence(sid)
 
+        last_stream_broadcast_at = 0.0
+
         async def broadcast_stream(content: str) -> None:
+            nonlocal last_stream_broadcast_at
+            now = time.monotonic()
+            if now - last_stream_broadcast_at < 0.032:
+                return
+            last_stream_broadcast_at = now
             await _broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id, session_id=sid)
 
         streaming_enabled = generation_service.should_stream_chat_reply(openai_preset)
@@ -2599,7 +2613,7 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
                                 hud_copy.notes = v
                 bot_chats_service.update_party_hud(card_id, chat_id, hud_copy)
                 reply = re.sub(r"\[HUD:\s*[^\]]+\]\s*", "", reply, flags=re.IGNORECASE).strip() or reply
-        avatar_url = next((card.image_url for card in character_cards_service.list_cards() if card.id == card_id), "")
+        avatar_url = _card_avatar_url(card_id)
         if replace_message_id:
             chat = bot_chats_service.replace_bot_message(card_id, chat_id, replace_message_id, chat.character_name, reply, avatar_url, reset_swipes)
         else:
