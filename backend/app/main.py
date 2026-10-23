@@ -2384,8 +2384,8 @@ async def add_bot_chat_message(card_id: str, chat_id: str, request: ChatMessageC
     last_msg = chat.messages[-1] if chat.messages else None
     all_ready = False
     if request.participant_id:
-        if not (last_msg and last_msg.is_ooc):
-            all_ready = session_service.advance_turn(sid, request.participant_id)
+        if not (last_msg and (last_msg.is_ooc or last_msg.is_dice_roll)):
+            session_service.advance_turn(sid, request.participant_id, mark_ready=False)
         await connection_manager.broadcast(
             sid,
             {"type": "typing.updated", "participant_id": request.participant_id, "name": request.author, "is_typing": False},
@@ -2410,7 +2410,6 @@ async def roll_bot_chat_dice(card_id: str, chat_id: str, request: ChatDiceRollRe
         raise HTTPException(status_code=404, detail="Chat not found") from error
     all_ready = False
     if request.participant_id:
-        all_ready = session_service.advance_turn(sid, request.participant_id)
         await _broadcast_presence(sid)
     await _broadcast_chat(card_id, chat_id, session_id=sid)
     if all_ready:
@@ -2608,9 +2607,18 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
                 if pl.name.strip():
                     details = ", ".join(p for p in [f"HP: {pl.hp}" if pl.hp else "", f"Status: {pl.status}" if pl.status else "", f"Inventory: {pl.inventory}" if pl.inventory else ""] if p)
                     hud_lines.append(f"- {pl.name.strip()}: {details or 'Active'}")
+            if getattr(hud, "auto_update", True):
+                hud_lines.append(
+                    "Instruction: If location, time, quest, notes, or any player's HP/status/inventory changes in this turn, append at the very end of your reply: "
+                    "[HUD: location=... | time=... | quest=... | PlayerName.hp=... | PlayerName.status=... | PlayerName.inv=+Item] (include only changed fields)."
+                )
+            if getattr(hud, "ai_roll_prompts", True):
+                hud_lines.append(
+                    "Dice checks: When a player attempts a risky or contested action without having rolled yet, ask for a roll at the end of your reply using: "
+                    "[ROLL: 1d20 | Проверка | DC 14] (or 2d20kh1 for advantage, 2d20kl1 for disadvantage)."
+                )
             hud_lines.append("]")
-            if len(hud_lines) > 2:
-                extra_before.append("\n".join(hud_lines))
+            extra_before.append("\n".join(hud_lines))
         if extra_before:
             existing_wb = str(world_info_payload.get("worldInfoBefore") or "").strip()
             world_info_payload["worldInfoBefore"] = ("\n\n".join([*extra_before, existing_wb]) if existing_wb else "\n\n".join(extra_before))
@@ -2648,17 +2656,45 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
                 hud_copy = chat.party_hud.model_copy(deep=True)
                 for hm in hud_matches:
                     for kv in hm.group(1).split("|"):
-                        if "=" in kv:
-                            k, v = [s.strip() for s in kv.split("=", 1)]
-                            kl = k.lower()
-                            if kl in {"location", "локация"}:
-                                hud_copy.location = v
-                            elif kl in {"time", "time_of_day", "время"}:
-                                hud_copy.time_of_day = v
-                            elif kl in {"quest", "квест", "цель"}:
-                                hud_copy.quest = v
-                            elif kl in {"notes", "заметки"}:
-                                hud_copy.notes = v
+                        if "=" not in kv:
+                            continue
+                        k, v = [s.strip() for s in kv.split("=", 1)]
+                        kl = k.lower()
+                        if kl in {"location", "локация"}:
+                            hud_copy.location = v
+                        elif kl in {"time", "time_of_day", "время"}:
+                            hud_copy.time_of_day = v
+                        elif kl in {"quest", "квест", "цель"}:
+                            hud_copy.quest = v
+                        elif kl in {"notes", "заметки"}:
+                            hud_copy.notes = v
+                        elif "." in k:
+                            p_name, p_field = [s.strip() for s in k.split(".", 1)]
+                            pf = p_field.lower()
+                            if not p_name:
+                                continue
+                            target_pl = next((pl for pl in hud_copy.players if pl.name.strip().lower() == p_name.lower()), None)
+                            if target_pl is None:
+                                from backend.app.services.bot_chats_service import PartyHudPlayer
+                                target_pl = PartyHudPlayer(name=p_name)
+                                hud_copy.players.append(target_pl)
+                            if pf in {"hp", "хп", "здоровье"}:
+                                target_pl.hp = v
+                            elif pf in {"status", "статус", "state"}:
+                                target_pl.status = v if v.lower() not in {"none", "нет", "-", "ok", "норма"} else ""
+                            elif pf in {"inv", "inventory", "инвентарь", "items"}:
+                                items = [it.strip() for it in target_pl.inventory.split(",") if it.strip()]
+                                if v.startswith("+"):
+                                    new_item = v[1:].strip()
+                                    if new_item and new_item.lower() not in {it.lower() for it in items}:
+                                        items.append(new_item)
+                                    target_pl.inventory = ", ".join(items)
+                                elif v.startswith("-"):
+                                    rem_item = v[1:].strip().lower()
+                                    items = [it for it in items if it.lower() != rem_item]
+                                    target_pl.inventory = ", ".join(items)
+                                else:
+                                    target_pl.inventory = v
                 bot_chats_service.update_party_hud(card_id, chat_id, hud_copy)
                 reply = re.sub(r"\[HUD:\s*[^\]]+\]\s*", "", reply, flags=re.IGNORECASE).strip() or reply
         avatar_url = _card_avatar_url(card_id)

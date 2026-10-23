@@ -48,12 +48,13 @@ class PartyHudPlayer(BaseModel):
 
 class PartyHudState(BaseModel):
     enabled: bool = False
+    auto_update: bool = True
+    ai_roll_prompts: bool = True
     location: str = ""
     time_of_day: str = ""
     quest: str = ""
     notes: str = ""
     players: list[PartyHudPlayer] = Field(default_factory=list)
-
 
 class BotChat(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
@@ -523,34 +524,70 @@ class BotChatsService:
             raw_formula = (raw_formula[:dc_match.start()] + raw_formula[dc_match.end():]).strip()
         if not label and " " in raw_formula:
             parts = raw_formula.split(" ", 1)
-            if re.match(r"^\d*d\d+(?:[+-]\d+)?$", parts[0].strip(), flags=re.IGNORECASE):
+            if re.match(r"^\d*d\d+(?:k[hl]\d+)?(?:[+-]\d+)?$", parts[0].strip(), flags=re.IGNORECASE):
                 raw_formula = parts[0].strip()
-                label = parts[1].strip(" []()")
-        m = re.match(r"^(\d*)d(\d+)([+-]\d+)?$", raw_formula.replace(" ", ""), flags=re.IGNORECASE)
+                label = parts[1].strip(" []()|·")
+        m = re.match(r"^(\d*)d(\d+)(?:k([hl])(\d+))?([+-]\d+)?$", raw_formula.replace(" ", ""), flags=re.IGNORECASE)
+        keep_mode = ""
+        keep_count = 0
         if m:
             count = min(50, max(1, int(m.group(1) or "1")))
             sides = min(1000, max(2, int(m.group(2))))
-            modifier = int(m.group(3) or "0")
-            formula_str = f"{count}d{sides}{f'{modifier:+d}' if modifier else ''}"
+            if m.group(3):
+                keep_mode = m.group(3).lower()
+                keep_count = min(count, max(1, int(m.group(4) or "1")))
+            modifier = int(m.group(5) or "0")
+            keep_str = f"k{keep_mode}{keep_count}" if keep_mode else ""
+            formula_str = f"{count}d{sides}{keep_str}{f'{modifier:+d}' if modifier else ''}"
         else:
             count, sides, modifier = 1, 20, 0
             formula_str = "1d20"
         rolls = [random.randint(1, sides) for _ in range(count)]
-        total = sum(rolls) + modifier
-        success: bool | None = (total >= dc) if dc is not None else None
+        if keep_mode == "h":
+            kept_rolls = sorted(rolls, reverse=True)[:keep_count]
+        elif keep_mode == "l":
+            kept_rolls = sorted(rolls)[:keep_count]
+        else:
+            kept_rolls = list(rolls)
+        base_sum = sum(kept_rolls)
+        total = base_sum + modifier
+        crit = ""
+        if sides == 20 and len(kept_rolls) == 1:
+            if kept_rolls[0] == 20:
+                crit = "nat20"
+            elif kept_rolls[0] == 1:
+                crit = "nat1"
+        if dc is not None:
+            if crit == "nat20":
+                success: bool | None = True
+            elif crit == "nat1":
+                success = False
+            else:
+                success = total >= dc
+        else:
+            success = None
         rolls_str = ", ".join(str(r) for r in rolls)
+        if keep_mode and len(rolls) > len(kept_rolls):
+            mode_tag = "преимущество" if keep_mode == "h" else "помеха"
+            rolls_display = f"[{rolls_str} → {mode_tag}: { base_sum }]"
+        else:
+            rolls_display = f"[{rolls_str}]"
         mod_str = f" {'+' if modifier > 0 else '-'} {abs(modifier)}" if modifier else ""
         label_str = f" ({label})" if label else ""
+        crit_str = " 🔥 КРИТ 20!" if crit == "nat20" else (" 💀 КРИТ 1!" if crit == "nat1" else "")
         dc_str = f" vs DC {dc} — {'УСПЕХ!' if success else 'ПРОВАЛ'}" if dc is not None else ""
-        content = f"🎲 {request.author.strip() or 'Player'} бросает {formula_str}{label_str}: [{rolls_str}]{mod_str} = {total}{dc_str}"
+        content = f"🎲 {request.author.strip() or 'Player'} бросает {formula_str}{label_str}: {rolls_display}{mod_str} = {total}{crit_str}{dc_str}"
         dice_data = {
             "formula": formula_str,
             "rolls": rolls,
+            "kept_rolls": kept_rolls,
+            "keep_mode": keep_mode,
             "modifier": modifier,
             "total": total,
             "label": label,
             "dc": dc,
             "success": success,
+            "crit": crit,
         }
         chat.messages.append(
             BotChatMessage(

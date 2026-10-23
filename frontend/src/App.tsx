@@ -106,6 +106,8 @@ type PartyHudPlayer = {
 
 type PartyHudState = {
   enabled: boolean;
+  auto_update?: boolean;
+  ai_roll_prompts?: boolean;
   location: string;
   time_of_day: string;
   quest: string;
@@ -840,10 +842,19 @@ export default function App() {
   const [roomsList, setRoomsList] = useState<RoomInfo[]>([]);
   const [roomInputDraft, setRoomInputDraft] = useState('');
   const [composerMode, setComposerMode] = useState<'normal' | 'ooc' | 'secret'>('normal');
+  const [diceRollerOpen, setDiceRollerOpen] = useState(false);
+  const [diceDraft, setDiceDraft] = useState<{ formula: string; modifier: string; dc: string; label: string }>({
+    formula: '1d20',
+    modifier: '',
+    dc: '',
+    label: '',
+  });
   const [partyHudExpanded, setPartyHudExpanded] = useState(false);
   const [partyHudEditing, setPartyHudEditing] = useState(false);
   const [partyHudDraft, setPartyHudDraft] = useState<PartyHudState>({
     enabled: false,
+    auto_update: true,
+    ai_roll_prompts: true,
     location: '',
     time_of_day: '',
     quest: '',
@@ -4088,7 +4099,7 @@ export default function App() {
                 {activeChat.party_hud.quest ? <span>🎯 {activeChat.party_hud.quest}</span> : null}
                 {activeChat.party_hud.players?.map((pl, idx) => (
                   <span key={idx} className="party-hud-player-chip">
-                    <strong>{pl.name}</strong>{pl.hp ? ` ❤️ ${pl.hp}` : ''}{pl.status ? ` · ${pl.status}` : ''}
+                    <strong>{pl.name}</strong>{pl.hp ? ` ❤️ ${pl.hp}` : ''}{pl.status ? ` · ${pl.status}` : ''}{pl.inventory ? ` · 🎒 ${pl.inventory}` : ''}
                   </span>
                 ))}
                 <button type="button" className="ghost-button hud-expand-btn" onClick={(e) => { e.stopPropagation(); setPartyHudExpanded((v) => !v); }}>
@@ -4145,7 +4156,28 @@ export default function App() {
                     ))}
                     <div className="party-hud-actions">
                       <button type="button" className="ghost-button" onClick={() => setPartyHudDraft({ ...partyHudDraft, players: [...(partyHudDraft.players || []), { name: selectedPersona?.name || 'Player', hp: '100/100', status: '', inventory: '' }] })}>+ Игрок</button>
+                      <button type="button" className="ghost-button" onClick={() => {
+                        const existing = new Set((partyHudDraft.players || []).map((p) => p.name.trim().toLowerCase()).filter(Boolean));
+                        const roomNames = connectedPlayers.map((p) => (p.persona_name || p.name || '').trim()).filter(Boolean);
+                        if (selectedPersona?.name && !roomNames.includes(selectedPersona.name.trim())) {
+                          roomNames.unshift(selectedPersona.name.trim());
+                        }
+                        const added = roomNames
+                          .filter((n) => !existing.has(n.toLowerCase()))
+                          .map((name) => ({ name, hp: '100/100', status: '', inventory: '' }));
+                        if (added.length) {
+                          setPartyHudDraft({ ...partyHudDraft, players: [...(partyHudDraft.players || []), ...added] });
+                        }
+                      }}>👥 + Из комнаты</button>
                       <button type="button" onClick={() => { void savePartyHud(partyHudDraft); setPartyHudExpanded(false); }}>Сохранить HUD</button>
+                      <label className="hud-disable-inline">
+                        <input type="checkbox" checked={partyHudDraft.auto_update !== false} onChange={(e) => setPartyHudDraft({ ...partyHudDraft, auto_update: e.target.checked })} />
+                        <span>🤖 Авто-HUD от бота</span>
+                      </label>
+                      <label className="hud-disable-inline">
+                        <input type="checkbox" checked={partyHudDraft.ai_roll_prompts !== false} onChange={(e) => setPartyHudDraft({ ...partyHudDraft, ai_roll_prompts: e.target.checked })} />
+                        <span>🎲 Проверки от ИИ</span>
+                      </label>
                       <label className="hud-disable-inline">
                         <input type="checkbox" checked={partyHudDraft.enabled} onChange={(e) => void togglePartyHudEnabled(e.target.checked)} />
                         <span>HUD включён</span>
@@ -4172,10 +4204,13 @@ export default function App() {
                 ? `🕵️ *${message.author} совершает тайное действие (известно только мастеру ИИ)…*`
                 : (message.display_text || message.content);
               const activeStreamSlice = displayedStreamText || generationStreamText;
-              const visibleMessageContent = generationReplaceMessageId === message.id && activeStreamSlice ? `${activeStreamSlice}▍` : displayContent;
+              const rawVisibleContent = generationReplaceMessageId === message.id && activeStreamSlice ? `${activeStreamSlice}▍` : displayContent;
               const rollPrompts = message.role === 'assistant'
-                ? Array.from(visibleMessageContent.matchAll(/\[ROLL:\s*([^\]]+)\]/gi)).map((m) => m[1].trim())
+                ? Array.from(rawVisibleContent.matchAll(/\[ROLL:\s*([^\]]+)\]/gi)).map((m) => m[1].trim())
                 : [];
+              const visibleMessageContent = message.role === 'assistant' && rollPrompts.length > 0
+                ? (rawVisibleContent.replace(/\[ROLL:\s*[^\]]+\]\s*/gi, '').trim() || rawVisibleContent)
+                : rawVisibleContent;
               return (
                <article
                  key={message.id}
@@ -4268,11 +4303,11 @@ export default function App() {
                         <div className="bot-roll-prompts">
                           {rollPrompts.map((rawSpec, rIdx) => {
                             const parts = rawSpec.split('|').map((s) => s.trim());
-                            const formulaMatch = rawSpec.match(/\b(\d*d\d+(?:[+-]\d+)?)\b/i);
+                            const formulaMatch = rawSpec.match(/\b(\d*d\d+(?:k[hl]\d+)?(?:[+-]\d+)?)\b/i);
                             const dcMatch = rawSpec.match(/\bDC\s*(\d+)\b/i);
                             const formula = formulaMatch ? formulaMatch[1] : '1d20';
                             const dc = dcMatch ? Number(dcMatch[1]) : undefined;
-                            const label = parts.filter((p) => !/^\d*d\d+/i.test(p) && !/^DC\s*\d+$/i.test(p)).join(' · ');
+                            const label = parts.filter((p) => !/^\d*d\d+(?:k[hl]\d+)?(?:[+-]\d+)?$/i.test(p) && !/^DC\s*\d+$/i.test(p)).join(' · ');
                             return (
                               <button
                                 key={rIdx}
@@ -4339,6 +4374,9 @@ export default function App() {
                 const turnPlayer = connectedPlayers.find((p) => p.id === currentTurnParticipantId) || connectedPlayers[0];
                 const isMyTurn = turnPlayer?.id === participantIdRef.current;
                 const amIReady = readyParticipantIds.includes(participantIdRef.current);
+                const waitingNames = connectedPlayers
+                  .filter((p) => !readyParticipantIds.includes(p.id))
+                  .map((p) => p.persona_name || p.name || 'Player');
                 return (
                   <span className={isMyTurn ? 'turn-indicator-pill my-turn' : 'turn-indicator-pill'}>
                     <span>{isMyTurn ? 'Ваш ход:' : 'Ход:'}</span>
@@ -4353,17 +4391,95 @@ export default function App() {
                       </button>
                     ) : null}
                     {turnMode === 'round_ready' ? (
-                      <button
-                        type="button"
-                        className={amIReady ? 'ghost-button pass-turn-button ready-active' : 'ghost-button pass-turn-button'}
-                        onClick={() => sendRealtimeEvent({ type: 'turn.ready', participant_id: participantIdRef.current, ready: !amIReady, card_id: activeCard?.id, chat_id: activeChat?.id })}
-                      >
-                        {amIReady ? `✓ Готов (${readyParticipantIds.length}/${connectedPlayers.length})` : `Готов? (${readyParticipantIds.length}/${connectedPlayers.length})`}
-                      </button>
+                      <>
+                        {waitingNames.length > 0 && readyParticipantIds.length > 0 ? (
+                          <small className="round-waiting-hint">ждём: {waitingNames.join(', ')}</small>
+                        ) : null}
+                        <button
+                          type="button"
+                          className={amIReady ? 'ghost-button pass-turn-button ready-active' : 'ghost-button pass-turn-button'}
+                          title="Общайтесь между собой и бросайте кубики свободно; нажмите, когда готовы к ответу бота"
+                          onClick={() => sendRealtimeEvent({ type: 'turn.ready', participant_id: participantIdRef.current, ready: !amIReady, card_id: activeCard?.id, chat_id: activeChat?.id })}
+                        >
+                          {amIReady ? `✓ Готов (${readyParticipantIds.length}/${connectedPlayers.length})` : `✓ Завершить ход (${readyParticipantIds.length}/${connectedPlayers.length})`}
+                        </button>
+                      </>
                     ) : null}
                   </span>
                 );
               })() : null}
+            </div>
+          ) : null}
+          {diceRollerOpen ? (
+            <div className="dice-roller-popover">
+              <div className="dice-roller-header">
+                <strong>🎲 Бросок кубика</strong>
+                <button type="button" className="ghost-button" onClick={() => setDiceRollerOpen(false)}>✕</button>
+              </div>
+              <div className="dice-preset-chips">
+                {[
+                  { label: '1d20', formula: '1d20' },
+                  { label: '🔥 Преимущество', formula: '2d20kh1' },
+                  { label: '💀 Помеха', formula: '2d20kl1' },
+                  { label: '1d6', formula: '1d6' },
+                  { label: '2d6', formula: '2d6' },
+                  { label: '1d100', formula: '1d100' },
+                ].map((preset) => (
+                  <button
+                    key={preset.formula}
+                    type="button"
+                    className={diceDraft.formula === preset.formula ? 'ghost-button active' : 'ghost-button'}
+                    onClick={() => setDiceDraft({ ...diceDraft, formula: preset.formula })}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <div className="dice-skill-chips">
+                {['Атака', 'Скрытность', 'Убеждение', 'Внимательность', 'Взлом', 'Уклонение'].map((skill) => (
+                  <button
+                    key={skill}
+                    type="button"
+                    className={diceDraft.label === skill ? 'ghost-button active' : 'ghost-button'}
+                    onClick={() => setDiceDraft({ ...diceDraft, label: diceDraft.label === skill ? '' : skill })}
+                  >
+                    {skill}
+                  </button>
+                ))}
+              </div>
+              <div className="dice-roller-inputs">
+                <label>
+                  <span>Кость</span>
+                  <input value={diceDraft.formula} placeholder="1d20" onChange={(e) => setDiceDraft({ ...diceDraft, formula: e.target.value })} />
+                </label>
+                <label>
+                  <span>Бонус</span>
+                  <input value={diceDraft.modifier} placeholder="+3 / -1" onChange={(e) => setDiceDraft({ ...diceDraft, modifier: e.target.value })} />
+                </label>
+                <label>
+                  <span>DC</span>
+                  <input type="number" value={diceDraft.dc} placeholder="15" onChange={(e) => setDiceDraft({ ...diceDraft, dc: e.target.value })} />
+                </label>
+                <label className="dice-label-field">
+                  <span>Проверка / Навык</span>
+                  <input value={diceDraft.label} placeholder="Взлом замка…" onChange={(e) => setDiceDraft({ ...diceDraft, label: e.target.value })} />
+                </label>
+              </div>
+              <div className="dice-roller-footer">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const base = (diceDraft.formula || '1d20').trim().replace(/[+-]\d+$/, '');
+                    const modNum = parseInt(diceDraft.modifier.trim(), 10);
+                    const modPart = !Number.isNaN(modNum) && modNum !== 0 ? (modNum > 0 ? `+${modNum}` : `${modNum}`) : '';
+                    const dcNum = parseInt(diceDraft.dc.trim(), 10);
+                    void rollDiceInChat(`${base}${modPart}`, diceDraft.label.trim(), !Number.isNaN(dcNum) && dcNum > 0 ? dcNum : undefined);
+                    setDiceRollerOpen(false);
+                  }}
+                >
+                  🎲 Бросить в чат
+                </button>
+              </div>
             </div>
           ) : null}
 
@@ -4375,7 +4491,7 @@ export default function App() {
                 isGenerating={isGenerating}
                 composerMode={composerMode}
                 setComposerMode={(m) => { setComposerMode(m); setComposerMenuOpen(false); }}
-                rollDice={() => { setComposerMenuOpen(false); void rollDiceInChat('1d20'); }}
+                rollDice={() => { setComposerMenuOpen(false); setDiceRollerOpen((v) => !v); }}
                 openMemory={() => { setComposerMenuOpen(false); setMemoryModalOpen(true); void loadSummaryMemorySettings(); }}
                 openChats={() => { setChatPickerOpen((open) => !open); setComposerMenuOpen(false); }}
                 rerollLastBotMessage={() => { setComposerMenuOpen(false); return rerollLastBotMessage(); }}
@@ -7599,7 +7715,7 @@ function ComposerActionMenu({
     <div className="composer-action-menu">
       <button type="button" onClick={openChats}>🗂️ {t('composer.chats')}</button>
       <button type="button" disabled={!activeChat || isGenerating} onClick={() => void rerollLastBotMessage()}>↻ {t('message.reroll')}</button>
-      <button type="button" disabled={!activeChat || isGenerating} onClick={rollDice}>🎲 Бросить кубик (1d20)</button>
+      <button type="button" disabled={!activeChat || isGenerating} onClick={rollDice}>🎲 Бросить кубик…</button>
       <button type="button" className={composerMode === 'ooc' ? 'active' : ''} onClick={() => setComposerMode(composerMode === 'ooc' ? 'normal' : 'ooc')}>💬 Режим OOC (вне игры)</button>
       <button type="button" className={composerMode === 'secret' ? 'active' : ''} onClick={() => setComposerMode(composerMode === 'secret' ? 'normal' : 'secret')}>🕵️ Тайный ход (скрыто)</button>
       <button type="button" onClick={openMemory}>📜 Память чата (Саммари)</button>

@@ -213,11 +213,12 @@ class SessionService:
         session = self.get_or_create_session(session_id)
         return session.model_dump(mode="json")
 
-    def advance_turn(self, session_id: str, participant_id: str) -> bool:
+    def advance_turn(self, session_id: str, participant_id: str, mark_ready: bool = False) -> bool:
         session = self.get_or_create_session(session_id)
         self._advance_turn(session, participant_id)
-        return self.mark_participant_ready(session_id, participant_id, ready=True)
-
+        if mark_ready:
+            return self.mark_participant_ready(session_id, participant_id, ready=True)
+        return False
     def set_turn_mode(self, session_id: str, mode: str) -> None:
         session = self.get_or_create_session(session_id)
         session.turn.mode = "round_ready" if mode == "round_ready" else "free"

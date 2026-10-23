@@ -5382,3 +5382,94 @@ input[type="range"] {
   gap: 0.4rem;
   cursor: pointer;
 }
+
+.round-waiting-hint {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin: 0 0.25rem;
+}
+
+.dice-roller-popover {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.65rem 0.75rem;
+  margin: 0 0.5rem 0.4rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  box-shadow: var(--shadow-strong);
+}
+
+.dice-roller-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.dice-roller-header button {
+  padding: 0.15rem 0.45rem;
+  min-height: 1.6rem;
+}
+
+.dice-preset-chips,
+.dice-skill-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.28rem;
+}
+
+.dice-preset-chips button,
+.dice-skill-chips button {
+  padding: 0.2rem 0.52rem;
+  min-height: 1.7rem;
+  font-size: 0.75rem;
+  border-radius: 999px;
+}
+
+.dice-preset-chips button.active,
+.dice-skill-chips button.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.dice-roller-inputs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(7rem, 1.8fr);
+  gap: 0.38rem;
+}
+
+.dice-roller-inputs label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.dice-roller-inputs input {
+  padding: 0.28rem 0.45rem;
+  font-size: 0.8rem;
+}
+
+.dice-roller-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.dice-roller-footer button {
+  padding: 0.32rem 0.75rem;
+  font-size: 0.8rem;
+}
+
+@media (max-width: 700px) {
+  .dice-roller-inputs {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .dice-roller-inputs .dice-label-field {
+    grid-column: 1 / -1;
+  }
+}
