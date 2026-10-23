@@ -187,13 +187,22 @@ def _target_sessions_for_chat(card_id: str, chat_id: str, primary_session_id: st
     return targets
 
 
+def _active_generation_keys() -> list[str]:
+    return [key for key, task in generation_tasks.items() if not task.done()]
+
+
 async def _broadcast_chat(card_id: str, chat_id: str, switch_active: bool = False, session_id: str = DEFAULT_SESSION_ID, chat: Any = None) -> None:
     session_service.set_active_chat(session_id, card_id, chat_id)
     resolved_chat = chat if chat is not None else bot_chats_service.get_chat(card_id, chat_id)
-    payload = {"type": "chat.updated", "card_id": card_id, "chat": resolved_chat.model_dump(mode="json"), "switch_active": switch_active}
+    payload = {
+        "type": "chat.updated",
+        "card_id": card_id,
+        "chat": resolved_chat.model_dump(mode="json"),
+        "switch_active": switch_active,
+        "active_generations": _active_generation_keys(),
+    }
     for target_sid in _target_sessions_for_chat(card_id, chat_id, session_id, switch_active):
         await connection_manager.broadcast(target_sid, payload)
-
 def _card_avatar_url(card_id: str) -> str:
     try:
         return character_cards_service.get_card(card_id).image_url
@@ -257,7 +266,11 @@ async def _broadcast_presence(session_id: str = DEFAULT_SESSION_ID) -> None:
     session_service.prune_disconnected(session_id, connection_manager.active_participant_ids(session_id))
     await connection_manager.broadcast(
         session_id,
-        {"type": "presence.updated", "session": session_service.snapshot(session_id)},
+        {
+            "type": "presence.updated",
+            "session": session_service.snapshot(session_id),
+            "active_generations": _active_generation_keys(),
+        },
     )
 def _actor_from_request(request: Request) -> str:
     actor = unquote(request.headers.get("x-doubletrouble-actor", "").strip())
@@ -2265,7 +2278,8 @@ async def get_bot_chat(card_id: str, chat_id: str, request: Request) -> dict[str
         chat = _ensure_card_first_message(card_id, chat_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="Chat not found") from error
-    return {"chat": chat.model_dump(mode="json")}
+    task = generation_tasks.get(f"{card_id}:{chat_id}")
+    return {"chat": chat.model_dump(mode="json"), "is_generating": bool(task and not task.done())}
 
 
 @app.put("/api/cards/{card_id}/chats/{chat_id}")
@@ -2626,7 +2640,6 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
             world_info_payload["extensionPrompts"] = request.extension_prompts
         sid = _session_id_from_request(http_request)
         session_service.reset_round_ready(sid)
-        await _broadcast_presence(sid)
 
         last_stream_broadcast_at = 0.0
 
@@ -2636,7 +2649,7 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
             if now - last_stream_broadcast_at < 0.032:
                 return
             last_stream_broadcast_at = now
-            await _broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id, session_id=sid)
+            asyncio.create_task(_broadcast_generation_state(card_id, chat_id, "generation.stream", content, replace_message_id, session_id=sid))
 
         streaming_enabled = generation_service.should_stream_chat_reply(openai_preset)
         if streaming_enabled:
@@ -2644,10 +2657,11 @@ async def request_card_bot_reply(card_id: str, chat_id: str, http_request: Reque
         else:
             task = asyncio.create_task(generation_service.generate_chat_reply(chat.character_name, history, openai_preset, character_data, persona_name, persona_description, world_info_payload, multi_user_mode))
         generation_tasks[task_key] = task
-        await _broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id, streaming=streaming_enabled, session_id=sid)
+        asyncio.create_task(_broadcast_presence(sid))
+        asyncio.create_task(_broadcast_generation_state(card_id, chat_id, "generation.started", replace_message_id=replace_message_id, streaming=streaming_enabled, session_id=sid))
         reply = await task
         if streaming_enabled:
-            await _broadcast_generation_state(card_id, chat_id, "generation.stream", reply, replace_message_id, session_id=sid)
+            asyncio.create_task(_broadcast_generation_state(card_id, chat_id, "generation.stream", reply, replace_message_id, session_id=sid))
         if regex_scripts:
             reply = RegexService.get_regexed_string(reply, RegexService.PLACEMENT_AI_OUTPUT, regex_scripts, is_prompt=False, user_name=user_name, char_name=char_name)
         if chat.party_hud and chat.party_hud.enabled:

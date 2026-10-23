@@ -53,7 +53,7 @@ class ConnectionManager:
 
     async def _send_one(self, session_id: str, websocket: WebSocket, event: dict[str, object]) -> WebSocket | None:
         try:
-            await asyncio.wait_for(websocket.send_json(event), timeout=6.0)
+            await asyncio.wait_for(websocket.send_json(event), timeout=1.5)
             return None
         except Exception:
             return websocket

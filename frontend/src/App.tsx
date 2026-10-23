@@ -1015,6 +1015,7 @@ export default function App() {
   const lastLocalSettingsSaveRef = useRef<Record<string, number>>({});
   const renderedExtensionMessageSignaturesRef = useRef<Map<string, string>>(new Map());
   const activeGenerationRef = useRef(false);
+  const isLocalGeneratingRef = useRef(false);
   const extensionLeaderId = connectedPlayers.length
     ? [...connectedPlayers].sort((left, right) => {
         if (left.is_admin !== right.is_admin) return left.is_admin ? -1 : 1;
@@ -1394,6 +1395,16 @@ export default function App() {
           const sameCard = Boolean(payload.card_id && activeCardRef.current?.id === payload.card_id);
           if (activeChatRef.current?.id === payload.chat.id || (sameCard && (!activeChatRef.current || payload.switch_active))) {
             setActiveChat(payload.chat);
+            if (Array.isArray(payload.active_generations)) {
+              const activeKey = `${payload.card_id || activeCardRef.current?.id || ''}:${payload.chat.id}`;
+              if (!payload.active_generations.includes(activeKey) && !isLocalGeneratingRef.current) {
+                activeGenerationRef.current = false;
+                setIsGenerating(false);
+                setGenerationStatus('');
+                setGenerationStreamText('');
+                setGenerationReplaceMessageId(null);
+              }
+            }
             if (payload.card_id) {
               rememberChatSelection(payload.card_id, payload.chat.id);
             }
@@ -1481,6 +1492,12 @@ export default function App() {
               activeGenerationRef.current = true;
               setIsGenerating(true);
               setGenerationStatus(`${activeCardRef.current.name || t('composer.bot')} ${t('composer.typing')}`);
+            } else if (!isLocalGeneratingRef.current) {
+              activeGenerationRef.current = false;
+              setIsGenerating(false);
+              setGenerationStatus('');
+              setGenerationStreamText('');
+              setGenerationReplaceMessageId(null);
             }
           }
           if (payload.session.active_card_id) {
@@ -2756,10 +2773,17 @@ export default function App() {
       }
       return false;
     }
-    const data = await response.json() as { chat: BotChat };
+    const data = await response.json() as { chat: BotChat; is_generating?: boolean };
     markAccessDenied('chats', false);
     setActiveCard(card);
     setActiveChat(data.chat);
+    if (data.is_generating === false && !isLocalGeneratingRef.current) {
+      activeGenerationRef.current = false;
+      setIsGenerating(false);
+      setGenerationStatus('');
+      setGenerationStreamText('');
+      setGenerationReplaceMessageId(null);
+    }
     setChatPickerOpen(false);
     rememberChatSelection(card.id, data.chat.id);
     await refreshCardChats(card.id);
@@ -3752,6 +3776,7 @@ export default function App() {
       setLibraryMessage(t('chat.error.selectCardAndChat'));
       return;
     }
+    isLocalGeneratingRef.current = true;
     activeGenerationRef.current = true;
     setIsGenerating(true);
     setGenerationStreamText('');
@@ -3760,13 +3785,16 @@ export default function App() {
     setLibraryMessage(replaceMessageId ? t('message.reroll') : t('message.botAnswering'));
     try {
       void emitSillyTavernGenerationEvent('started');
+      const presetName = presetNameDraft.trim() || selectedPresetName || 'unsaved';
+      const currentPresetSig = `${selectedPresetTypeRef.current}:${presetName}:${presetJsonDraft}`;
+      const shouldSendInlinePreset = selectedPresetTypeRef.current === 'openai' && activePresetDraftSignatureRef.current !== currentPresetSig;
       const response = await fetch(`/api/cards/${encodeURIComponent(card.id)}/chats/${encodeURIComponent(chat.id)}/bot/reply`, {
         method: 'POST',
         headers: authJsonHeaders(),
         body: JSON.stringify({
           replace_message_id: replaceMessageId || null,
           reset_swipes: resetSwipes,
-          openai_preset: selectedPresetTypeRef.current === 'openai' ? parsePresetDraft(presetJsonDraft) : null,
+          openai_preset: shouldSendInlinePreset ? parsePresetDraft(presetJsonDraft) : null,
           persona_id: selectedPersona?.id || '',
           persona_name: selectedPersona?.name || '',
           persona_description: selectedPersona?.description || '',
@@ -3811,6 +3839,7 @@ export default function App() {
         }
       }
     } finally {
+      isLocalGeneratingRef.current = false;
       activeGenerationRef.current = false;
       setIsGenerating(false);
       setGenerationStreamText('');

@@ -9,6 +9,17 @@ import httpx
 from backend.app.llm.base import GenerationRequest
 
 
+_SHARED_CLIENT: httpx.AsyncClient | None = None
+
+
+def _get_shared_client() -> httpx.AsyncClient:
+    global _SHARED_CLIENT
+    if _SHARED_CLIENT is None or _SHARED_CLIENT.is_closed:
+        _SHARED_CLIENT = httpx.AsyncClient(
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=60.0),
+        )
+    return _SHARED_CLIENT
+
 class OpenAICompatibleProvider:
     def __init__(
         self,
@@ -42,14 +53,14 @@ class OpenAICompatibleProvider:
             return {"ok": False, "error": "base_url is not configured"}
 
         headers = self._headers()
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            try:
-                response = await client.get(f"{self.base_url}{self.models_path}", headers=headers, params=self.extra_query or None)
-            except httpx.HTTPError as error:
-                return {"ok": False, "error": str(error)}
-            if response.status_code >= 400:
-                return {"ok": False, "status_code": response.status_code, "error": response.text}
-            return {"ok": True, "models": response.json()}
+        client = _get_shared_client()
+        try:
+            response = await client.get(f"{self.base_url}{self.models_path}", headers=headers, params=self.extra_query or None, timeout=self.timeout_seconds)
+        except httpx.HTTPError as error:
+            return {"ok": False, "error": str(error)}
+        if response.status_code >= 400:
+            return {"ok": False, "status_code": response.status_code, "error": response.text}
+        return {"ok": True, "models": response.json()}
 
     async def generate(self, request: GenerationRequest) -> str:
         if not self.base_url:
@@ -58,15 +69,16 @@ class OpenAICompatibleProvider:
             raise RuntimeError("LLM model is not configured")
 
         body = self._request_body(request, stream=False)
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.post(
-                f"{self.base_url}{self.chat_path}",
-                headers=self._headers(),
-                json=body,
-                params=self.extra_query or None,
-            )
-            response.raise_for_status()
-            data = response.json()
+        client = _get_shared_client()
+        response = await client.post(
+            f"{self.base_url}{self.chat_path}",
+            headers=self._headers(),
+            json=body,
+            params=self.extra_query or None,
+            timeout=self._timeout(),
+        )
+        response.raise_for_status()
+        data = response.json()
 
         show_thoughts = request.parameters.get("__show_thoughts", True) is not False
         choice = (data.get("choices") or [{}])[0]
@@ -91,14 +103,15 @@ class OpenAICompatibleProvider:
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
         }
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}{self.chat_path}",
-                headers=stream_headers,
-                json=body,
-                params=self.extra_query or None,
-            ) as response:
+        client = _get_shared_client()
+        async with client.stream(
+            "POST",
+            f"{self.base_url}{self.chat_path}",
+            headers=stream_headers,
+            json=body,
+            params=self.extra_query or None,
+            timeout=self._timeout(),
+        ) as response:
                 if response.status_code >= 400:
                     await response.aread()
                 response.raise_for_status()
